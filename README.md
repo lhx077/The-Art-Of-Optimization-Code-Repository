@@ -4,7 +4,7 @@ Companion exercise repository for *The Art of Optimization: A Deep Dive into the
 
 ## Prerequisites
 
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (Preview)
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - Recommended IDE: Visual Studio 2022 17.14+ / JetBrains Rider 2025.1+ / VS Code + C# Dev Kit
 
 ## Getting Started
