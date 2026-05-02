@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "Exercise01.KestrelPerformanceBenchmarks": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:53832;http://localhost:53835"
+    }
+  }
+}

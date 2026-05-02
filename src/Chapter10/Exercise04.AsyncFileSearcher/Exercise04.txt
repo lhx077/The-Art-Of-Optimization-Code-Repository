@@ -1,0 +1,26 @@
+================================================================================
+  Chapter 10, Exercise 04: Async File Search Tool
+================================================================================
+
+Objective
+---------
+Build an async tool that searches a large binary file for a target byte pattern.
+
+Requirements
+------------
+  - Use Memory<byte> / ReadOnlyMemory<byte> at async boundaries.
+  - Use ArrayPool<byte> for reusable buffers.
+  - Read the file asynchronously in chunks.
+  - Correctly detect matches crossing chunk boundaries.
+  - Return all matching absolute file offsets.
+
+Implementation Advice
+---------------------
+  - Keep the last patternLength - 1 bytes from the previous chunk.
+  - Prefix them to the next read region before searching.
+  - Use Span.IndexOf for the inner search loop.
+  - Keep async logic only at the I/O boundary and parsing/searching synchronous.
+
+Performance Goal
+----------------
+Minimize allocations while maintaining good throughput on multi-megabyte files.

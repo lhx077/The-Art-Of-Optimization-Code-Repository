@@ -1,0 +1,315 @@
+================================================================================
+Chapter 20 — Parallel Computing
+               Thought Question Answers
+================================================================================
+
+
+Question 1: When using Parallel.For to process an array of one million elements,
+what strategy would you choose if each element takes about 1 microsecond to
+process? How would your strategy change if processing times vary widely, from 1
+microsecond to 100 milliseconds? Explain your reasoning.
+--------------------------------------------------------------------------------
+
+If every element costs roughly the same amount of time, the workload is uniform.
+In that case, the main goal is to keep scheduling overhead small while giving each
+worker enough work to amortize coordination cost.
+
+For the uniform 1-microsecond case, a good strategy is:
+  - use Parallel.For with the default range partitioner or a coarse static-style partition
+  - avoid tiny per-item synchronization inside the loop
+  - use thread-local accumulation or batching if results must be combined
+
+Why this works:
+  - the work is predictable
+  - load balancing does not need to be extremely dynamic
+  - overly fine-grained scheduling would waste time compared with the tiny per-item cost
+
+The situation changes when per-element cost ranges from 1 microsecond to 100 milliseconds.
+Now the problem is not overhead alone, but severe load imbalance.
+
+If the loop is partitioned too statically, one worker may receive several very
+expensive items while another finishes early and becomes idle. So for highly
+skewed workloads, the better choice is:
+  - dynamic partitioning or range chunking with smaller chunks
+  - work stealing behavior from the TPL scheduler
+  - possibly Parallel.ForEach over a dynamic partitioner instead of a rigid static split
+
+That increases scheduling overhead somewhat, but the extra cost is worth paying to
+avoid long tail imbalance.
+
+So the core tradeoff is:
+  - uniform tiny work -> prefer coarser partitioning and lower scheduling overhead
+  - highly variable work -> prefer more dynamic load balancing even if overhead rises
+
+
+Question 2: You need to process 1000 HTTP requests in parallel, and each request
+may take between 100ms and 5s. Implementing this with Parallel.ForEach and
+Parallel.ForEachAsync leads to different tradeoffs. Analyze the pros and cons of
+both approaches, and explain when each should be chosen.
+--------------------------------------------------------------------------------
+
+HTTP requests are fundamentally asynchronous I/O operations, not CPU-bound work.
+That fact strongly favors Parallel.ForEachAsync.
+
+Parallel.ForEach:
+  - was designed primarily around synchronous delegate bodies
+  - works well for CPU-bound loops
+  - can be forced to handle async work only by blocking on each request, for example
+    with GetAwaiter().GetResult() or .Result
+
+Problems with using Parallel.ForEach for HTTP requests:
+  - blocking threads while waiting on network I/O wastes thread-pool capacity
+  - high latency variance means many worker threads sit idle but occupied
+  - it increases the risk of thread-pool starvation under heavy load
+
+Parallel.ForEachAsync:
+  - accepts an asynchronous body directly
+  - allows awaiting HTTP calls without blocking worker threads
+  - naturally supports bounded concurrency through MaxDegreeOfParallelism
+  - fits variable-latency I/O workloads much better
+
+Pros of Parallel.ForEachAsync:
+  - better scalability for large numbers of in-flight network requests
+  - lower thread usage while waiting on sockets
+  - simpler, correct async composition
+
+Cons of Parallel.ForEachAsync:
+  - slightly more async machinery and state-machine overhead
+  - not ideal if the work inside each iteration is mostly CPU-bound and synchronous
+
+So the choice is usually straightforward:
+  - choose Parallel.ForEach for CPU-bound synchronous work
+  - choose Parallel.ForEachAsync for naturally asynchronous I/O-heavy work such as HTTP requests
+
+In this scenario, Parallel.ForEachAsync is the correct default.
+
+
+Question 3: What performance impact does PLINQ's AsOrdered() have? In what
+scenarios is the cost worth paying? If you need to preserve order but still want
+high performance, what alternatives exist?
+--------------------------------------------------------------------------------
+
+AsOrdered forces PLINQ to preserve source order in the final output stream.
+That guarantee costs performance because parallel workers can no longer emit
+results as soon as they are ready without regard to position.
+
+The main costs are:
+  - extra bookkeeping to track original ordering
+  - buffering of results that finish early but cannot yet be emitted
+  - reduced freedom for downstream stages to consume completed work immediately
+  - potentially worse tail latency when one earlier element is slow and later
+    completed results must wait behind it
+
+The cost is worth paying when output order is semantically important, such as:
+  - generating a user-visible ordered report
+  - preserving record order for a protocol or file format
+  - deterministic testing or comparison output
+  - downstream logic that assumes original sequence order
+
+If order must be preserved but you want to retain as much performance as possible,
+alternatives include:
+
+1. Attach indexes, process unordered, then sort once at the end.
+   Pros:
+     - lets computation run more freely in parallel
+   Cons:
+     - final sort adds memory and time cost
+
+2. Partition the source into larger ordered chunks.
+   Pros:
+     - reduces fine-grained ordering overhead
+   Cons:
+     - less flexible than full unordered processing
+
+3. Preserve order only at the final projection boundary.
+   Pros:
+     - maximizes unordered work in the expensive middle stages
+   Cons:
+     - requires pipeline restructuring
+
+So AsOrdered is valuable when correctness or API expectations require it, but if
+order is merely convenient rather than essential, dropping it usually improves throughput.
+
+
+Question 4: Explain why using lock inside a parallel loop for accumulation can be
+slower than sequential execution. Design an experiment to verify this and propose
+at least three improvements, comparing their performance characteristics.
+--------------------------------------------------------------------------------
+
+A lock inside a hot parallel accumulation loop serializes the critical operation.
+Even though many threads exist, they all compete for the same protected update.
+That creates contention, cache coherence traffic, and scheduling overhead.
+
+So instead of getting parallel speedup, you often get:
+  - the overhead of parallel scheduling
+  - the overhead of lock acquisition and release
+  - contention on one shared memory location
+  - possible lock convoying under heavy pressure
+
+This can easily be slower than a simple sequential for-loop that updates a local
+variable in a cache-friendly way.
+
+A simple experiment:
+  1. Create a large array of integers.
+  2. Measure sequential sum.
+  3. Measure Parallel.For with a lock around `sum += values[i]`.
+  4. Measure improved variants.
+  5. Compare runtime and allocation using BenchmarkDotNet.
+
+Three strong improvements:
+
+1. Thread-local partial sums in Parallel.For.
+   Each worker accumulates into a local variable, and only the final merge touches
+   shared state.
+   Performance:
+     - usually much faster than per-iteration lock
+     - low contention
+
+2. Interlocked.Add on chunked partial results.
+   Accumulate locally for a chunk, then publish using Interlocked only once per chunk.
+   Performance:
+     - better than locking every iteration
+     - still more shared-state traffic than pure thread-local merge
+
+3. PLINQ Sum.
+   Let PLINQ handle partitioning and local aggregation internally.
+   Performance:
+     - concise and often competitive
+     - may not beat a carefully tuned manual version, but usually avoids the worst mistakes
+
+4. SIMD plus parallel chunking.
+   Use vectorized local sums per partition.
+   Performance:
+     - best when data size is large enough and arithmetic dominates
+     - more complex implementation
+
+The general principle is: do not synchronize every iteration if you can aggregate
+privately and merge rarely.
+
+
+Question 5: Task.WhenAny returns the completed Task itself rather than its result.
+What advantages does this design provide? In a "first successful response wins"
+race pattern, how should other unfinished tasks be canceled and their exceptions
+handled correctly?
+--------------------------------------------------------------------------------
+
+Returning the completed Task itself gives maximum flexibility.
+
+Advantages:
+  - the caller can inspect which task actually completed
+  - the caller can distinguish success, failure, and cancellation before extracting the result
+  - it works uniformly across Task and Task<T>
+  - it avoids forcing the API to invent a result-shaping abstraction for heterogeneous tasks
+
+In a “first successful response wins” race:
+  1. Start all candidate tasks with a shared CancellationTokenSource.
+  2. Repeatedly await Task.WhenAny on the remaining tasks.
+  3. If the completed task succeeded, capture its result.
+  4. Cancel the shared token so the losing tasks can stop promptly.
+  5. Observe or await the losing tasks afterward so their exceptions do not go unobserved.
+
+Why the extra cleanup matters:
+  - canceled or faulted loser tasks may still complete later
+  - ignoring them can lose diagnostic information or leave faults unobserved
+  - some tasks may need disposal or resource cleanup paths to run
+
+So the correct pattern is not just “take the winner and forget the rest,” but
+“take the winner, signal cancellation, then drain the losers safely.”
+
+
+Question 6: How does BoundedCapacity in TPL Dataflow implement backpressure? In a
+pipeline with multiple TransformBlock stages, what happens if one middle stage is
+slow? How should capacity limits be designed?
+--------------------------------------------------------------------------------
+
+BoundedCapacity limits how many messages a block can buffer or actively hold.
+When that limit is reached, upstream posting or sending can no longer proceed
+freely. That is the essence of backpressure.
+
+What this means in practice:
+  - a producer calling SendAsync may have to wait
+  - an upstream linked block may stop handing off more data
+  - memory use is kept under control because queues cannot grow without bound
+
+If a middle TransformBlock is slower than surrounding stages:
+  - its input queue fills up first
+  - once full, it stops accepting new items promptly
+  - upstream blocks begin to stall because they cannot forward data downstream
+  - eventually the slowdown propagates backward through the entire pipeline
+
+This is a feature, not a bug. Backpressure makes the real bottleneck visible and
+prevents unbounded buffering.
+
+How to choose capacities:
+  - enough capacity to smooth short bursts
+  - not so much capacity that memory use explodes or latency hides bottlenecks
+  - smaller capacities for memory-heavy items
+  - somewhat larger capacities where producer burstiness is expected and items are cheap
+
+So capacity is a control knob that balances throughput smoothing, latency, and memory footprint.
+
+
+Question 7: Compare ActionBlock and Channel<T> for producer-consumer scenarios.
+When should TPL Dataflow be chosen, and when is Channel more appropriate?
+--------------------------------------------------------------------------------
+
+Both can implement producer-consumer pipelines, but they live at different levels
+of abstraction.
+
+ActionBlock:
+  - is a higher-level TPL Dataflow building block
+  - directly combines queueing, concurrency control, completion semantics, and a processing delegate
+  - integrates naturally with larger Dataflow graphs
+
+Channel<T>:
+  - is a lower-level asynchronous queue primitive
+  - gives direct control over producers, consumers, buffering, and read/write loops
+  - is lightweight and flexible, but requires more manual orchestration
+
+Choose TPL Dataflow when:
+  - the pipeline naturally consists of blocks and links
+  - you want built-in completion propagation and bounded-capacity behavior
+  - you need graph-like topologies such as branching, joining, or broadcast patterns
+  - readability of pipeline composition matters
+
+Choose Channel when:
+  - you want a simpler, lower-level queue abstraction
+  - the workflow is custom and does not map neatly to Dataflow blocks
+  - you prefer explicit async loops and minimal framework overhead
+  - you need fine-grained control over consumer orchestration
+
+So Dataflow is usually better for rich pipeline graphs; Channel is better for lean,
+custom asynchronous queues.
+
+
+Question 8: When using JoinBlock, what problems arise if the two input sources
+produce data at very different rates? How can BroadcastBlock or other mechanisms
+help?
+--------------------------------------------------------------------------------
+
+JoinBlock pairs items from multiple sources. If one side is much faster than the
+other, several problems can appear.
+
+1. Buffer growth on the fast side.
+   The faster input may accumulate waiting items while the slower side catches up.
+
+2. Increased latency.
+   A fast item cannot proceed until a matching partner arrives from the other side.
+
+3. Memory waste.
+   If pairing is delayed for long periods, queued items consume memory without doing useful work.
+
+4. Semantic mismatch.
+   Sometimes you do not actually need strict one-to-one pairing, but JoinBlock enforces it.
+
+BroadcastBlock can help in scenarios where one item should be fanned out to many
+consumers rather than queued for strict pairwise matching. More broadly, possible
+solutions include:
+  - use BroadcastBlock when the same value should be observed by multiple downstream stages
+  - use batching or windowing instead of strict one-item joins
+  - insert bounded-capacity blocks to limit memory growth
+  - redesign the correlation model so pairing is key-based rather than strict arrival-order based
+  - use latest-value style semantics if the slow side only needs the newest update
+
+So the main issue is that JoinBlock assumes balanced pair production. When that
+assumption is false, buffering, latency, and memory pressure often reveal the mismatch.

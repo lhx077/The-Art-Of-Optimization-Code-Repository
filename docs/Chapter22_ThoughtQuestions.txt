@@ -1,0 +1,171 @@
+================================================================================
+Chapter 22 — ASP.NET Core High-Performance Practices
+                    Thought Question Answers
+================================================================================
+
+
+Question 1: In containerized environments, Kestrel configuration often needs to
+be adjusted for memory limits, CPU limits, and network characteristics. How
+should connection limits, buffer sizes, and GC settings be tuned?
+--------------------------------------------------------------------------------
+
+In containers, the first rule is to tune for the actual resource budget rather
+than for the host machine's full capacity.
+
+1. Connection limits.
+   If CPU is limited, an extremely high connection count can cause excessive
+   context switching and queue growth. A practical strategy is to cap the number
+   of concurrent upgraded connections, WebSocket sessions, or request body
+   buffering work so the service fails fast instead of collapsing under load.
+
+2. Buffer sizes.
+   Large buffers increase throughput for large payloads, but they also raise the
+   working set and can trigger more GC pressure in small containers. In memory-
+   constrained pods, smaller request and response buffering thresholds are often
+   safer, especially when the API mostly handles small JSON payloads.
+
+3. GC configuration.
+   Server GC is usually appropriate for high-throughput APIs, but container-aware
+   limits matter. The process should respect memory ceilings so that GC does not
+   aggressively expand the heap and get killed by the orchestrator. If the
+   service is CPU-limited and latency-sensitive, it may also be worth testing the
+   tradeoff between raw throughput and pause behavior under realistic traffic.
+
+4. Network behavior.
+   Ingress proxies, sidecars, and NAT layers change the network profile. That can
+   influence keep-alive duration, request header limits, and HTTP/2 concurrency
+   choices. Long-lived idle connections are not free in a container fleet.
+
+So the tuning principle is: bound concurrency, keep buffers no larger than the
+payload distribution requires, and validate GC behavior against the container's
+real memory and CPU quota.
+
+
+Question 2: Middleware ordering matters for performance. If you need a logging
+middleware that records detailed request information including response time, how
+should it be placed and implemented to minimize overhead on normal requests?
+--------------------------------------------------------------------------------
+
+The logging middleware should be early enough to see the whole request lifetime,
+but not so early that it pays avoidable cost for traffic that will be rejected by
+the host or infrastructure before useful application work begins.
+
+A good practical placement is usually:
+  - after forwarded-header or correlation-id setup
+  - before authentication, authorization, MVC, gRPC, or endpoint execution
+  - after extremely cheap short-circuit protections if those protections should
+    not produce full detail logs
+
+Implementation details matter even more than position:
+  1. Use a single Stopwatch or ValueStopwatch-style timer per request.
+  2. Avoid allocating formatted strings during the hot path unless the log level
+     actually requires them.
+  3. Prefer structured logging with precompiled LoggerMessage patterns.
+  4. Do not read or buffer the request body by default; only do so for targeted
+     diagnostics.
+  5. Emit one summary log at the end instead of many small logs during normal
+     execution.
+  6. Keep exception logging on the rare path.
+
+The goal is to make the common path almost free: start timing, call the next
+middleware, stop timing, and log compact structured fields only when needed.
+
+
+Question 3: Cache invalidation is difficult. In an e-commerce system, product
+data should be cached for performance, but price and inventory must stay correct
+in real time. How would you balance performance and accuracy?
+--------------------------------------------------------------------------------
+
+The key is to separate data by consistency requirement instead of treating the
+entire product record as one cache entry.
+
+A strong strategy is:
+  - cache slow-changing descriptive data such as title, images, attributes, and
+    long descriptions with longer TTLs
+  - treat price and inventory as short-lived, separately versioned, or event-
+    driven fields with much tighter freshness rules
+
+Useful techniques include:
+  1. Cache decomposition.
+     Store product metadata separately from price and stock.
+
+  2. Event-driven invalidation.
+     When price or stock changes, publish an event that invalidates or updates
+     the hot keys immediately.
+
+  3. Stale-while-revalidate for safe fields.
+     Product descriptions can tolerate staleness better than inventory counts.
+
+  4. Read-through plus short TTL for sensitive fields.
+     A few seconds of caching for inventory may still be acceptable in some
+     systems, but checkout must always revalidate against the source of truth.
+
+  5. Version tokens or change numbers.
+     Keys can include a product version so old cached content becomes obsolete
+     naturally after updates.
+
+So the balance is not “cache everything” versus “cache nothing.” It is “cache the
+stable parts aggressively, and keep transactional fields synchronized with events,
+short TTLs, and final authoritative checks.”
+
+
+Question 4: gRPC has performance advantages over REST, but it requires additional
+infrastructure support. In a gradual microservice migration, how would you
+introduce gRPC while minimizing risk and complexity?
+--------------------------------------------------------------------------------
+
+The safest strategy is incremental adoption on internal service-to-service paths
+first, not a big-bang replacement of public APIs.
+
+A practical rollout plan is:
+  1. Keep the existing external REST surface stable.
+  2. Introduce gRPC first between a small number of internal services where both
+     caller and callee are under your control.
+  3. Choose workloads that benefit clearly, such as high-QPS, low-latency, or
+     strongly typed request/response flows.
+  4. Use shared contracts, code generation, and compatibility tests to prevent
+     schema drift.
+  5. Ensure the platform supports HTTP/2, observability, and load balancing
+     before expanding the footprint.
+  6. Keep REST fallbacks or adapters during the transition period.
+
+This approach limits blast radius. Teams learn the tooling, protocol, and
+operational model on a narrow path before using gRPC more broadly.
+
+
+Question 5: SignalR commonly uses Redis as a backplane for scale-out. Under very
+high message rates Redis may become a bottleneck. What alternatives or
+optimizations can improve scalability?
+--------------------------------------------------------------------------------
+
+There are several options, and the right choice depends on whether the problem is
+fan-out volume, connection count, or cross-node coordination cost.
+
+Possible approaches include:
+  1. Azure SignalR Service or a managed real-time gateway.
+     Offloading fan-out to a specialized service is often the simplest way to
+     scale beyond a single Redis backplane.
+
+  2. Partitioned routing.
+     Route users or groups consistently to the same node so fewer messages need
+     cross-node broadcasting.
+
+  3. Kafka, RabbitMQ, or another broker-backed fan-out design.
+     For very high throughput event distribution, a streaming or messaging system
+     may scale better than using Redis pub/sub as the only backbone.
+
+  4. Reduce backplane traffic.
+     Coalesce updates, batch messages, compress payloads, or send deltas rather
+     than full state snapshots.
+
+  5. Group design optimization.
+     Large overlapping groups can cause duplicate cross-node work. Cleaner group
+     partitioning can reduce unnecessary fan-out.
+
+  6. Hybrid design.
+     Use SignalR for connection management and targeted real-time delivery, but
+     move bulk stream distribution to a separate event transport.
+
+So Redis is a useful default, but at extreme scale the better answer is often to
+reduce cross-node chatter or adopt infrastructure built specifically for large
+real-time fan-out.

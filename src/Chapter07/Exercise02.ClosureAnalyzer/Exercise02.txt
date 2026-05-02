@@ -1,0 +1,127 @@
+============================================================================
+Exercise 02 -- Closure Analysis Tool: Detecting Hidden Allocations in Lambdas
+============================================================================
+
+OBJECTIVE
+  Build a Roslyn DiagnosticAnalyzer that detects lambda expressions causing
+  closure allocations and suggests optimizations. The finished product is a
+  NuGet analyzer package that reports warnings at compile time.
+
+BACKGROUND: HOW CLOSURES WORK IN C#
+  When a lambda captures a variable from its enclosing scope, the compiler
+  generates a hidden "display class" to hold the captured variables as
+  fields. A new instance is heap-allocated every time the method executes.
+
+  - Each closure creates a new object on the managed heap. In hot loops
+    this puts significant pressure on the garbage collector.
+  - A lambda that captures nothing can be cached as a static delegate.
+    C# 9+ lets you enforce this with the `static` modifier.
+  - A lambda accessing an instance field or method implicitly captures
+    `this`, pinning the containing object and risking memory leaks.
+  - Multiple lambdas in one method may share a single display class,
+    causing variables to live longer than expected.
+
+WHAT THE ANALYZER SHOULD DETECT
+  1. Lambdas capturing local variables (closure allocation)
+  2. Lambdas capturing `this` (implicit capture via instance member access)
+  3. Lambdas in loops (closure allocated per iteration)
+  4. Lambdas that could be static (no captures needed)
+
+IMPLEMENTATION ROADMAP
+
+  Step 1: Project Setup
+    Create a .NET Standard 2.0 class library (required for analyzer host
+    compatibility). Add NuGet packages:
+      Microsoft.CodeAnalysis.CSharp (4.x)
+      Microsoft.CodeAnalysis.CSharp.Workspaces (4.x)
+    Inherit from DiagnosticAnalyzer; override SupportedDiagnostics and
+    Initialize.
+
+  Step 2: Detect Lambda Expressions
+    In Initialize, register a SyntaxNodeAction for:
+      - SyntaxKind.SimpleLambdaExpression       (x => ...)
+      - SyntaxKind.ParenthesizedLambdaExpression ((x, y) => ...)
+    The callback receives SyntaxNodeAnalysisContext, giving you access to
+    both the syntax node and the SemanticModel.
+
+  Step 3: Analyze Captures
+    For each lambda body, call SemanticModel.AnalyzeDataFlow(lambdaBody).
+    The returned DataFlowAnalysis exposes:
+      - CapturedInside  : symbols declared outside but used inside
+      - CapturedOutside : symbols declared inside but used outside
+    For each symbol in CapturedInside, determine:
+      a) Local variable or parameter?  --> local-variable capture
+      b) Instance field/property/method? --> implicit this-capture
+    If CapturedInside is empty and the lambda lacks `static`, flag it as
+    a candidate for the "could be static" diagnostic.
+
+  Step 4: Detect Loop Context
+    Walk up the syntax tree via .Ancestors(). If any ancestor is a
+    ForStatementSyntax, ForEachStatementSyntax, WhileStatementSyntax, or
+    DoStatementSyntax, and the lambda has captures, report the loop
+    diagnostic.
+
+  Step 5: Define Diagnostic Descriptors
+    CLOS001  Warning   "Lambda captures local variable '{0}', causing
+                        a closure allocation."
+    CLOS002  Warning   "Lambda captures 'this' implicitly via instance
+                        member '{0}'."
+    CLOS003  Warning   "Lambda inside loop body allocates a closure on
+                        every iteration."
+    CLOS004  Info      "Lambda captures nothing -- consider adding the
+                        'static' modifier."
+    Report at the lambda's arrow token location for consistent squiggles.
+
+  Step 6: Suggest Fixes (CodeFixProvider)
+    - CLOS004: insert `static` keyword before the parameter list.
+    - CLOS003: hoist the delegate outside the loop.
+    - CLOS002: extract to a static local function with explicit parameters.
+
+TESTING STRATEGY
+  Use Microsoft.CodeAnalysis.CSharp.Analyzer.Testing.XUnit for unit tests.
+  Recommended cases:
+    1. Lambda capturing a local int        --> expect CLOS001
+    2. Lambda reading an instance field     --> expect CLOS002
+    3. Capturing lambda inside a for loop   --> expect CLOS001 + CLOS003
+    4. Lambda using only its own parameters --> expect CLOS004
+    5. Already-static lambda, no captures   --> expect no diagnostic
+    6. Static local function as delegate    --> expect no diagnostic
+  Verify no false positives on LINQ queries or Span-based APIs where
+  closure cost is acceptable or the compiler can optimize away.
+
+PACKAGING
+  In the .csproj:
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <DevelopmentDependency>true</DevelopmentDependency>
+  Place the DLL in the NuGet analyzers folder:
+    <None Include="$(OutputPath)\ClosureAnalyzer.dll"
+          Pack="true" PackagePath="analyzers/dotnet/cs" />
+  Run `dotnet pack -c Release`. Consumers reference the package and get
+  warnings automatically in their IDE and CI builds.
+
+FURTHER EXPLORATION
+  Once the basic analyzer works, consider these extensions:
+  - Detect closures over struct variables (boxing allocation on capture).
+  - Warn when a captured variable is only read, suggesting it be passed
+    by value to a static local function instead.
+  - Integrate with BenchmarkDotNet to measure allocation reduction in a
+    sample project before and after applying the analyzer's suggestions.
+
+KEY TAKEAWAYS
+  - Closures are a hidden source of heap allocations in hot paths. A
+    single lambda in a tight loop can generate thousands of short-lived
+    objects per second.
+  - The compiler's display class generation is invisible in source code.
+    Without tooling, developers cannot tell an allocation is happening.
+  - Static lambdas (C# 9+) eliminate closure allocation when no capture
+    is needed -- a zero-cost annotation with real performance benefit.
+  - Roslyn analyzers catch these issues at compile time, before they
+    reach production. Building one deepens your understanding of both
+    the compiler's code generation and the Roslyn API surface.
+  - The skills you build here transfer directly to writing analyzers for
+    any code pattern you want to enforce across a codebase.
+
+============================================================================
+End of Exercise 02 guidance.
+============================================================================

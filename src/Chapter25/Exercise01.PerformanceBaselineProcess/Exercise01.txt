@@ -1,0 +1,63 @@
+Exercise 01 — Build a Performance Baseline
+==========================================
+
+Goal
+----
+Create a repeatable baseline for 3-5 critical business scenarios so performance
+regressions become visible before they reach production.
+
+Recommended workflow
+--------------------
+1. Choose scenarios that actually matter to users or business operations.
+   Good examples:
+   - login request processing
+   - order creation
+   - search query execution
+   - report generation
+   - cache hit / miss paths
+
+2. Define the metrics for each scenario.
+   At minimum record:
+   - latency
+   - throughput
+   - managed allocations
+
+   If relevant, also record:
+   - p95 / p99 latency
+   - CPU usage
+   - GC collections
+
+3. Implement BenchmarkDotNet benchmarks.
+   Keep inputs deterministic and representative. Avoid toy inputs that make the
+   benchmark easy to run but irrelevant to production behavior.
+
+4. Record the first accepted baseline.
+   Store the benchmark output in version control or in CI artifacts so later
+   results have an authoritative comparison point.
+
+5. Integrate benchmark execution into CI/CD.
+   This does not need to run on every tiny commit if it is expensive. A common
+   pattern is:
+   - smoke benchmark on pull request
+   - full benchmark suite nightly or before release
+
+6. Set a gate threshold.
+   A practical rule is to block merges when a key metric regresses by more than
+   10 percent unless the team explicitly approves the tradeoff.
+
+7. Revisit the baseline periodically.
+   If the product shape changes, update the benchmark suite so it still reflects
+   the real system.
+
+Deliverables
+------------
+- benchmark project
+- baseline result file
+- CI/CD integration step
+- documented regression threshold policy
+
+What good looks like
+--------------------
+A good result is not “we have many benchmarks.” A good result is that the team
+can answer, at any moment, whether a change made important scenarios faster,
+slower, or more memory-intensive.

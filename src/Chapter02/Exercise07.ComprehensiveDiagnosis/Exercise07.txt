@@ -1,0 +1,162 @@
+===========================================================================
+ Exercise 07 — Comprehensive Performance Diagnosis: A Guided Framework
+===========================================================================
+
+OBJECTIVE
+---------
+
+This exercise is intentionally provided as a guided framework rather than
+a complete, runnable solution. A genuine comprehensive diagnosis is always
+specific to the application under investigation — its architecture, its
+workload profile, its deployment environment, and its performance
+requirements. No canned example can fully replicate that experience.
+
+The goal is to build a sample console application that simulates an order
+processing pipeline, embed several realistic performance problems into it,
+and then systematically diagnose and resolve each one using the full
+diagnostic toolkit introduced throughout Chapter 2. By the end of this
+exercise, you should be able to move fluently between coarse-grained
+timing, profiler-driven hotspot analysis, micro-benchmarking, and deep
+runtime inspection — selecting the right tool for each stage of the
+investigation.
+
+
+SUGGESTED APPLICATION STRUCTURE
+-------------------------------
+
+Build a console application that processes a batch of 10,000 simulated
+orders through a multi-stage pipeline. Each stage should contain one
+intentional performance defect:
+
+  1. Logging Stage — Excessive String Concatenation
+     Construct log messages by repeatedly concatenating strings with the
+     "+" operator inside a loop. This creates a cascade of intermediate
+     string allocations, each slightly larger than the last, resulting in
+     quadratic memory consumption and significant GC pressure.
+
+  2. Caching Stage — Unbounded Cache Growth
+     Maintain an in-memory dictionary that caches order lookup results but
+     never evicts entries. Over the course of the batch, the cache grows
+     without bound, consuming increasing amounts of memory and eventually
+     triggering Gen2 garbage collections as the working set expands.
+
+  3. Validation Stage — Synchronous I/O Blocking the Thread Pool
+     Simulate an external validation service by calling Thread.Sleep or
+     performing synchronous file reads inside Task.Run. This saturates the
+     thread pool, starving other concurrent work and introducing latency
+     spikes as the pool struggles to grow fast enough to meet demand.
+
+  4. Transformation Stage — Large Object Heap Fragmentation
+     Allocate temporary byte arrays larger than 85,000 bytes to perform
+     data transformations, then discard them. Repeated allocation and
+     deallocation of large objects fragments the LOH, increasing memory
+     consumption and triggering expensive full (Gen2 + LOH) collections.
+
+  5. Enrichment Stage — N+1 Query Pattern
+     For each order, call a method that retrieves supplementary data one
+     item at a time (simulating individual database queries). The correct
+     approach would batch these lookups into a single call, but the N+1
+     pattern issues 10,000 individual calls where one would suffice.
+
+
+DIAGNOSIS METHODOLOGY
+---------------------
+
+Approach the diagnosis in five progressive stages, each using a more
+specialized tool than the last. This layered strategy ensures that you
+invest expensive, detailed analysis only on the areas that matter most.
+
+  Step 1: Stopwatch — Establish Rough Timing
+     Wrap the entire pipeline and each individual stage in Stopwatch
+     measurements. This takes minutes to implement and immediately reveals
+     which stages dominate overall execution time. The numbers need not be
+     statistically rigorous at this point; the goal is triage.
+
+  Step 2: CPU Profiler (Visual Studio or dotTrace) — Identify Hotspots
+     Attach a sampling profiler to the application and run the full batch.
+     The profiler's call tree and hot-path views will surface the top three
+     CPU consumers, often revealing that the bottleneck is not where
+     intuition suggested. Pay attention to both inclusive and exclusive
+     time: a method with high inclusive but low exclusive time is merely a
+     caller of the true hotspot.
+
+  Step 3: BenchmarkDotNet — Measure Precisely
+     Extract each identified hotspot into an isolated benchmark. This
+     removes the noise of the surrounding application and provides
+     statistically sound measurements with confidence intervals. Run the
+     benchmark before and after applying a fix to quantify the improvement
+     with precision.
+
+  Step 4: PerfView — Analyze GC Behavior and Memory
+     Collect a PerfView trace with GC and allocation events enabled. The
+     GCStats view reveals collection frequency, pause durations, and
+     generation distribution. The allocation stacks view pinpoints which
+     methods are responsible for the heaviest allocation traffic. Look
+     specifically for LOH allocations (the fragmentation problem) and for
+     objects surviving into Gen2 (the unbounded cache).
+
+  Step 5: EventCounters / dotnet-counters — Monitor Runtime Metrics
+     Run dotnet-counters alongside the application to observe real-time
+     metrics: GC heap size, Gen0/Gen1/Gen2 collection counts, thread pool
+     queue length, and working set. This provides a live dashboard that
+     confirms whether your fixes have the expected effect on runtime
+     behavior without requiring a full profiling session.
+
+
+PERFORMANCE REPORT TEMPLATE
+----------------------------
+
+A well-structured performance report transforms raw measurements into
+actionable engineering decisions. Every report should contain:
+
+  Executive Summary — A one-paragraph statement of the overall finding:
+  what was investigated, what the most significant issue is, and what the
+  recommended next step is. This section is written for stakeholders who
+  will not read the rest of the document.
+
+  Methodology — Which tools were used, on what hardware, under what
+  workload, and with what configuration. Reproducibility depends on this
+  section being thorough enough that another engineer could replicate the
+  measurements independently.
+
+  Findings — Each finding should include five elements: a description of
+  the observed symptom, the evidence (profiler screenshots, benchmark
+  tables, counter graphs), the identified root cause, the applied fix,
+  and before-and-after metrics demonstrating the improvement.
+
+  Recommendations — Prioritized list of further actions, including any
+  issues discovered but not yet addressed, suggested monitoring to
+  prevent recurrence, and architectural considerations for long-term
+  performance health.
+
+  Appendix — Raw benchmark output, PerfView trace summaries, counter
+  logs, and any other supporting data that substantiates the findings
+  without cluttering the main narrative.
+
+
+KEY TAKEAWAYS
+-------------
+
+No single tool gives the complete picture. Stopwatch tells you where time
+is spent but not why. A CPU profiler reveals hotspots but is blind to
+memory pressure. BenchmarkDotNet provides precise measurements but only
+for code you have already identified as suspicious. PerfView exposes GC
+and allocation behavior but requires expertise to interpret. EventCounters
+offer real-time visibility but lack the depth of a full trace. Mastery
+lies in knowing when to reach for each tool and how to synthesize their
+outputs into a coherent diagnosis.
+
+The recommended workflow moves from broad to narrow: start with Stopwatch
+to triage, use a profiler to identify suspects, benchmark to measure
+precisely, and dive into PerfView or counters only when the simpler tools
+leave questions unanswered. Always measure before and after every
+optimization — intuition about performance is notoriously unreliable, and
+an "optimization" that is not validated by measurement is merely a hope.
+
+Finally, document your findings. Performance knowledge is perishable: the
+engineer who diagnosed the issue today may not be available when a similar
+problem surfaces six months from now. A well-written performance report
+serves as institutional memory, enabling the team to recognize recurring
+patterns, avoid previously identified pitfalls, and build a culture where
+performance is treated as a first-class engineering concern rather than an
+afterthought.

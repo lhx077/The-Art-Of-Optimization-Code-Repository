@@ -1,0 +1,796 @@
+================================================================================
+  Chapter 8, Exercise 6: Deep GC Event Profiling with PerfView/dotnet-trace
+  "The Art of Optimization: Deep Dive into .NET Performance"
+================================================================================
+
+TABLE OF CONTENTS
+  1. Objective
+  2. Tool Setup
+  3. Step-by-Step Procedure
+  4. Key Metrics to Examine
+  5. Analysis Report Template
+  6. Common Patterns and Anti-Patterns
+  7. Advanced Techniques
+
+================================================================================
+1. OBJECTIVE
+================================================================================
+
+This exercise focuses on capturing and analyzing runtime Garbage Collection
+events using ETW (Event Tracing for Windows) and EventPipe-based tooling. By
+the end of this exercise, you should be able to:
+
+  - Capture GC events from a running .NET process using PerfView or
+    dotnet-trace.
+  - Analyze the GC timeline, including per-generation collection frequency
+    and stop-the-world (STW) pause durations.
+  - Identify how GC threads interleave with application threads, and
+    understand the impact of GC pauses on application responsiveness.
+  - Produce a targeted analysis report with actionable recommendations for
+    reducing GC overhead.
+
+This is an open-ended, tool-driven exercise. There is no single correct
+output. The goal is to develop proficiency with the diagnostic workflow
+itself, which is an essential skill for production performance work.
+
+================================================================================
+2. TOOL SETUP
+================================================================================
+
+2.1 PerfView (Windows Only)
+--------------------------------------------------------------------------------
+
+Download:
+  https://github.com/microsoft/perfview/releases
+
+PerfView is a standalone .exe that requires no installation. Download the
+latest PerfView.exe and place it in a convenient directory. Run it as
+Administrator for full ETW access.
+
+Basic verification:
+  PerfView.exe /?
+
+PerfView collects ETW traces natively on Windows and provides built-in GC
+analysis views (GC Stats, GC Heap Alloc Stacks, etc.). It is the gold
+standard for .NET GC diagnostics on Windows.
+
+2.2 dotnet-trace (Cross-Platform)
+--------------------------------------------------------------------------------
+
+Installation:
+  dotnet tool install --global dotnet-trace
+
+Verify installation:
+  dotnet-trace --version
+
+dotnet-trace uses EventPipe, which is built into the .NET runtime and works
+on Windows, Linux, and macOS. It does not require elevated privileges for
+same-user processes.
+
+Key provider for GC events:
+  Microsoft-Windows-DotNETRuntime
+
+Provider configuration syntax:
+  <ProviderName>:<Keywords>:<Level>
+
+For GC events specifically:
+  - Keywords: 0x1 (GC keyword)
+  - Level: 5 (Verbose) for full detail, 4 (Informational) for less noise
+
+2.3 dotnet-counters (Real-Time Monitoring)
+--------------------------------------------------------------------------------
+
+Installation:
+  dotnet tool install --global dotnet-counters
+
+Usage for real-time GC monitoring:
+  dotnet-counters monitor --process-id <PID> --counters System.Runtime
+
+This displays live counters including:
+  - gc-heap-size
+  - gen-0-gc-count, gen-1-gc-count, gen-2-gc-count
+  - alloc-rate
+  - % time in gc
+  - gc-fragmentation
+
+dotnet-counters is useful for a quick sanity check before committing to a
+full trace capture.
+
+================================================================================
+3. STEP-BY-STEP PROCEDURE
+================================================================================
+
+3.1 Create a Sample Application with Known GC Pressure
+--------------------------------------------------------------------------------
+
+Save the following as GCPressureApp.cs and build it as a console application.
+This program deliberately creates GC pressure across all generations to
+produce a rich trace.
+
+------------ BEGIN CODE ------------
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace GCPressureApp
+{
+    class Program
+    {
+        // Long-lived list that promotes objects to Gen 2
+        static readonly List<byte[]> LongLived = new();
+
+        // Simulates LOH allocations (objects >= 85,000 bytes)
+        static readonly List<byte[]> LargeObjects = new();
+
+        static void Main(string[] args)
+        {
+            Console.WriteLine($"Process ID: {Environment.ProcessId}");
+            Console.WriteLine("Press ENTER to start GC pressure workload...");
+            Console.ReadLine();
+
+            Console.WriteLine("Running workload for 60 seconds...");
+
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            var token = cts.Token;
+
+            int iteration = 0;
+
+            while (!token.IsCancellationRequested)
+            {
+                iteration++;
+
+                // Pattern 1: Short-lived allocations (Gen 0 pressure)
+                for (int i = 0; i < 1000; i++)
+                {
+                    _ = new byte[1024]; // 1 KB, dies immediately
+                }
+
+                // Pattern 2: Mid-life objects (Gen 0 -> Gen 1 promotion)
+                var midLife = new List<byte[]>();
+                for (int i = 0; i < 100; i++)
+                {
+                    midLife.Add(new byte[4096]); // 4 KB each
+                }
+                Thread.Sleep(5); // Keep alive across a GC boundary
+                midLife.Clear();
+
+                // Pattern 3: Long-lived objects (Gen 2 promotion)
+                if (iteration % 50 == 0)
+                {
+                    LongLived.Add(new byte[8192]);
+                    if (LongLived.Count > 500)
+                        LongLived.RemoveAt(0); // Churn in Gen 2
+                }
+
+                // Pattern 4: LOH allocations
+                if (iteration % 200 == 0)
+                {
+                    LargeObjects.Add(new byte[100_000]); // LOH
+                    if (LargeObjects.Count > 50)
+                        LargeObjects.RemoveAt(0);
+                }
+
+                // Pattern 5: Pinning simulation
+                if (iteration % 100 == 0)
+                {
+                    var pinned = new byte[2048];
+                    var handle = System.Runtime.InteropServices.GCHandle.Alloc(
+                        pinned,
+                        System.Runtime.InteropServices.GCHandleType.Pinned);
+                    Thread.Sleep(1);
+                    handle.Free();
+                }
+            }
+
+            Console.WriteLine("Workload complete.");
+            Console.WriteLine($"Final GC counts - Gen0: {GC.CollectionCount(0)}, " +
+                              $"Gen1: {GC.CollectionCount(1)}, " +
+                              $"Gen2: {GC.CollectionCount(2)}");
+        }
+    }
+}
+
+------------ END CODE ------------
+
+Build and run:
+  dotnet new console -n GCPressureApp
+  (Replace Program.cs with the code above)
+  dotnet build -c Release
+  dotnet run -c Release
+
+Note the Process ID printed at startup. You will need it for trace capture.
+
+3.2 Capture GC Events with dotnet-trace
+--------------------------------------------------------------------------------
+
+In a separate terminal, while the sample app is running:
+
+  dotnet-trace collect \
+    --providers Microsoft-Windows-DotNETRuntime:0x1:5 \
+    -p <PID> \
+    -o gc_trace.nettrace
+
+Explanation of the provider string:
+  Microsoft-Windows-DotNETRuntime  - The .NET runtime event provider
+  0x1                              - Keywords bitmask: GC events only
+  5                                - Verbosity level: Verbose
+
+Let the trace run for at least 30 seconds to capture a representative
+sample, then press ENTER or Ctrl+C to stop collection.
+
+The output file gc_trace.nettrace can be opened in:
+  - PerfView (Windows)
+  - Visual Studio (Windows, with Diagnostics Tools)
+  - Speedscope (https://www.speedscope.app/, cross-platform, limited GC)
+
+To convert to Chromium trace format for broader tool compatibility:
+  dotnet-trace convert gc_trace.nettrace --format Speedscope
+
+3.3 Capture with PerfView (Windows)
+--------------------------------------------------------------------------------
+
+Option A: GC-only collection (minimal overhead, recommended for production):
+
+  PerfView /GCCollectOnly collect
+
+This captures only GC events with very low overhead. PerfView will prompt
+you to stop collection when ready.
+
+Option B: Full GC collection with allocation stacks:
+
+  PerfView /GCOnly collect
+
+This adds allocation tick events, which allow you to see allocation call
+stacks. Higher overhead but more diagnostic detail.
+
+Option C: Command-line with specific duration:
+
+  PerfView /GCCollectOnly /MaxCollectSec:60 /NoGui collect
+
+This collects for exactly 60 seconds without opening the GUI.
+
+The output is an ETL file (e.g., PerfViewGCCollectOnly.etl.zip).
+
+3.4 Open the Trace in PerfView and Navigate to GC Stats
+--------------------------------------------------------------------------------
+
+1. Launch PerfView.exe.
+2. File -> Open -> select the .etl.zip or .nettrace file.
+3. In the tree view on the left, expand the trace file node.
+4. Double-click "GC Stats" to open the GC analysis view.
+
+The GC Stats view presents:
+  - A summary table of all GC events, one row per collection.
+  - Columns: GC Index, Generation, Pause Duration (ms), Trigger Reason,
+    Type (Blocking/Background), Promoted Bytes, etc.
+  - Rollup statistics at the top: total counts, average/max pause, etc.
+
+5. Click "GC Rollup By Generation" for a per-generation summary.
+6. Click individual GC rows to see detailed per-GC information.
+
+3.5 Analyze the Results
+--------------------------------------------------------------------------------
+
+With the GC Stats view open, examine the following:
+
+GC Pause Times:
+  - Sort by "Pause MSec" descending to find the longest pauses.
+  - Note whether long pauses correlate with Gen 2 or LOH collections.
+  - Check if Background GC is being used (Type column).
+
+Generation Distribution:
+  - Compare Gen 0, Gen 1, and Gen 2 collection counts.
+  - A healthy ratio is roughly 10:1 Gen0:Gen1 and 10:1 Gen1:Gen2.
+  - Excessive Gen 2 collections indicate long-lived object churn.
+
+Allocation Rate:
+  - Look at the "Alloc MB/MSec" or total allocated bytes.
+  - High allocation rates drive more frequent Gen 0 collections.
+
+Trigger Reasons:
+  - "AllocSmall" = normal Gen 0 budget exhaustion.
+  - "AllocLarge" = LOH allocation triggered a collection.
+  - "InducedNotForced" / "Induced" = explicit GC.Collect() calls.
+
+================================================================================
+4. KEY METRICS TO EXAMINE
+================================================================================
+
+4.1 % Time in GC
+--------------------------------------------------------------------------------
+The percentage of elapsed wall-clock time spent in GC pauses. This is the
+single most important high-level GC health metric.
+
+  - < 5%:  Healthy. GC overhead is negligible.
+  - 5-10%: Moderate. Worth investigating if latency-sensitive.
+  - > 10%: Problematic. Application throughput is significantly impacted.
+
+Available via:
+  - dotnet-counters: "% Time in GC" counter
+  - PerfView GC Stats: shown in the summary section
+  - EventCounter: System.Runtime / time-in-gc
+
+4.2 Gen 0 / Gen 1 / Gen 2 Collection Counts and Frequencies
+--------------------------------------------------------------------------------
+Track the absolute count and the rate (collections per second) for each
+generation.
+
+  Gen 0: Should be frequent (tens to hundreds per second under load).
+         Each Gen 0 collection should be fast (sub-millisecond to low
+         single-digit milliseconds).
+
+  Gen 1: Moderate frequency. Gen 1 acts as a buffer between the nursery
+         and the tenured generation.
+
+  Gen 2: Should be infrequent. Each Gen 2 collection is expensive because
+         it scans the entire managed heap. Frequent Gen 2 collections are
+         a red flag.
+
+Ratio guidance:
+  Gen0:Gen1 ratio of 5:1 to 20:1 is typical.
+  Gen1:Gen2 ratio of 5:1 to 50:1 is typical.
+  If Gen2 collections are more than 10% of Gen1, investigate.
+
+4.3 Max and P99 Pause Times
+--------------------------------------------------------------------------------
+The maximum and 99th-percentile GC pause durations in milliseconds.
+
+  - For interactive/UI applications: target < 10 ms P99.
+  - For server applications: target < 20 ms P99.
+  - For latency-critical services: target < 5 ms P99.
+
+Long tail pauses often come from:
+  - Full blocking Gen 2 collections
+  - LOH compaction
+  - Suspension delays (time to stop all threads)
+
+In PerfView, sort the GC events table by pause duration to identify
+outliers. Check the "Suspend MSec" column separately, as suspension
+delays are sometimes the dominant component.
+
+4.4 Allocation Rate (MB/sec)
+--------------------------------------------------------------------------------
+The rate at which the application allocates managed memory.
+
+  - Measured in MB/sec via dotnet-counters ("Allocation Rate").
+  - High allocation rates (hundreds of MB/sec) drive frequent GC.
+  - Reducing allocation rate is often the most effective optimization.
+
+Allocation rate is a leading indicator. GC pause time is a lagging
+indicator. Optimize the cause (allocations), not the symptom (pauses).
+
+4.5 LOH Allocation Triggers
+--------------------------------------------------------------------------------
+Large Object Heap allocations (objects >= 85,000 bytes) are expensive:
+  - They are allocated directly on the LOH, bypassing Gen 0.
+  - LOH collections happen during Gen 2 GC.
+  - LOH is not compacted by default (can be enabled with
+    GCSettings.LargeObjectHeapCompactionMode).
+
+In PerfView, filter GC events by Trigger Reason = "AllocLarge" to see
+how many collections were caused by LOH pressure.
+
+4.6 Pinned Object Count
+--------------------------------------------------------------------------------
+Pinned objects prevent the GC from relocating memory during compaction,
+leading to fragmentation.
+
+Sources of pinning:
+  - Explicit GCHandle.Alloc with GCHandleType.Pinned
+  - fixed statements in unsafe code
+  - Interop marshaling (P/Invoke)
+  - Async I/O buffers (internal runtime pinning)
+
+In PerfView, the "Pinned Object" column in GC events shows the count
+of pinned objects at the time of each collection.
+
+4.7 Fragmentation Ratio
+--------------------------------------------------------------------------------
+The ratio of free space to total committed heap size.
+
+  Fragmentation % = (Free Bytes / Total Heap Size) * 100
+
+  - < 10%: Normal.
+  - 10-30%: Moderate. May indicate pinning or LOH fragmentation.
+  - > 30%: High. Investigate pinning, LOH usage, and compaction.
+
+Available via:
+  - dotnet-counters: "GC Fragmentation" counter (.NET 7+)
+  - PerfView: shown in GC Stats per-GC detail
+
+================================================================================
+5. ANALYSIS REPORT TEMPLATE
+================================================================================
+
+Use the following template to structure your findings. Fill in each section
+based on the data collected from your trace.
+
+--- BEGIN REPORT TEMPLATE ---
+
+GC PERFORMANCE ANALYSIS REPORT
+Application: [Application Name]
+Date: [Date of Analysis]
+Trace Duration: [Duration in seconds]
+.NET Version: [e.g., .NET 8.0.x]
+OS / Platform: [e.g., Windows 11 x64]
+
+1. EXECUTIVE SUMMARY
+   [2-3 sentences summarizing the overall GC health and the most critical
+   finding. Example: "The application spends 12% of wall-clock time in GC,
+   primarily driven by frequent Gen 2 collections caused by long-lived
+   object churn in the cache layer. Reducing cache entry size or switching
+   to a pooled buffer strategy is recommended."]
+
+2. GC CONFIGURATION
+   GC Mode:            [Server / Workstation]
+   Concurrent GC:      [Enabled / Disabled]
+   Latency Mode:       [Interactive / Batch / LowLatency / SustainedLowLatency]
+   Heap Count:         [Number of heaps, relevant for Server GC]
+   LOH Compaction:     [Default (no compaction) / CompactOnce]
+   Regions:            [Enabled / Disabled (.NET 7+ feature)]
+
+   How to determine these values:
+   - GCSettings.IsServerGC, GCSettings.LatencyMode in code
+   - PerfView GC Stats header section
+   - runtimeconfig.json: "System.GC.Server", "System.GC.Concurrent"
+
+3. COLLECTION FREQUENCY TABLE
+
+   Generation | Count | Rate (/sec) | Avg Pause (ms) | Max Pause (ms) | P99 Pause (ms)
+   -----------|-------|-------------|-----------------|-----------------|----------------
+   Gen 0      |       |             |                 |                 |
+   Gen 1      |       |             |                 |                 |
+   Gen 2      |       |             |                 |                 |
+   Gen 2 (BG) |       |             |                 |                 |
+
+   Notes:
+   - "Gen 2 (BG)" = Background Gen 2 collections (concurrent, lower pause).
+   - Separate blocking Gen 2 from background Gen 2 in the analysis.
+
+4. PAUSE TIME DISTRIBUTION
+
+   Range (ms)     | Count | % of Total
+   ---------------|-------|----------
+   0 - 1          |       |
+   1 - 5          |       |
+   5 - 10         |       |
+   10 - 20        |       |
+   20 - 50        |       |
+   50 - 100       |       |
+   100+           |       |
+
+   Longest pause: [X] ms (GC #[N], Gen [G], Reason: [R])
+
+5. ALLOCATION HOTSPOTS
+   [If allocation stacks were captured (PerfView /GCOnly), list the top
+   allocation sites by volume.]
+
+   Rank | Allocation Site (Method)          | Allocated (MB) | % of Total
+   -----|-----------------------------------|----------------|----------
+   1    |                                   |                |
+   2    |                                   |                |
+   3    |                                   |                |
+
+6. RECOMMENDATIONS
+   [Numbered list of specific, actionable recommendations. Examples:]
+
+   1. Reduce allocation rate in [specific method] by pooling byte[] buffers
+      using ArrayPool<byte>.Shared.
+   2. Avoid promoting mid-life objects by processing them within a single
+      Gen 0 budget window.
+   3. Replace List<byte[]> cache with a fixed-size ring buffer to eliminate
+      Gen 2 churn.
+   4. Consider enabling Server GC for this multi-threaded server workload.
+   5. Investigate LOH allocations; consider splitting large arrays into
+      segments below the 85,000-byte threshold.
+
+--- END REPORT TEMPLATE ---
+
+================================================================================
+6. COMMON PATTERNS AND ANTI-PATTERNS
+================================================================================
+
+6.1 Mid-Life Crisis
+--------------------------------------------------------------------------------
+Description:
+  Objects that survive Gen 0 collection but die shortly after being promoted
+  to Gen 1 or Gen 2. This is one of the most common and costly GC patterns.
+
+Symptoms:
+  - High Gen 1 collection rate relative to Gen 0.
+  - Significant "Promoted Bytes" in Gen 0 collections.
+  - Objects appear in Gen 1/2 but have short actual lifetimes.
+
+Root Causes:
+  - Asynchronous operations that keep references alive across await points.
+  - Buffering patterns where data is held just long enough to survive Gen 0.
+  - Event handlers or callbacks that extend object lifetime.
+
+Mitigation:
+  - Reduce object lifetime so it dies within Gen 0 (process faster).
+  - Use stack-allocated or pooled buffers (Span<T>, ArrayPool<T>).
+  - Avoid capturing references in closures that outlive the Gen 0 window.
+
+6.2 LOH Fragmentation
+--------------------------------------------------------------------------------
+Description:
+  Repeated allocation and deallocation of large objects (>= 85,000 bytes)
+  on the Large Object Heap causes fragmentation because the LOH is not
+  compacted by default.
+
+Symptoms:
+  - Growing committed memory despite stable live object count.
+  - High fragmentation ratio on the LOH.
+  - OutOfMemoryException despite available virtual address space.
+
+Root Causes:
+  - Allocating large byte arrays for I/O buffers, serialization, etc.
+  - Varying sizes of large allocations creating irregular free gaps.
+
+Mitigation:
+  - Use ArrayPool<byte>.Shared.Rent() for large buffers.
+  - Standardize large allocation sizes to improve free-list reuse.
+  - Consider GCSettings.LargeObjectHeapCompactionMode =
+    GCLargeObjectHeapCompactionMode.CompactOnce before a known idle period.
+  - In .NET 8+, the GC regions feature reduces LOH fragmentation impact.
+
+6.3 Pinning Preventing Compaction
+--------------------------------------------------------------------------------
+Description:
+  Pinned objects cannot be moved by the GC during compaction, creating
+  immovable islands that fragment the heap.
+
+Symptoms:
+  - High fragmentation ratio despite low LOH usage.
+  - Pinned object counts visible in GC event data.
+  - Memory growth over time without corresponding increase in live data.
+
+Root Causes:
+  - Frequent P/Invoke calls with pinned buffers.
+  - Long-duration async I/O operations pinning buffers.
+  - Explicit GCHandle pinning without timely release.
+
+Mitigation:
+  - Use Pinned Object Heap (POH) in .NET 5+ for long-lived pinned buffers:
+    GC.AllocateArray<byte>(size, pinned: true)
+  - Minimize pin duration; unpin as soon as the native call completes.
+  - Pool pinned buffers rather than allocating new ones.
+
+6.4 Finalizer Queue Backup
+--------------------------------------------------------------------------------
+Description:
+  Objects with finalizers (~ClassName() or inheriting from IDisposable with
+  a destructor) require two GC cycles to be collected: one to detect they
+  are unreachable and queue them for finalization, and another to actually
+  reclaim the memory after the finalizer runs.
+
+Symptoms:
+  - Growing finalizer queue length (visible in PerfView).
+  - Objects surviving an extra generation due to the two-pass requirement.
+  - Finalizer thread falling behind under high allocation rates.
+
+Root Causes:
+  - Not calling Dispose() / not using 'using' statements.
+  - Finalizers that perform blocking or slow operations.
+  - High rate of finalizable object creation.
+
+Mitigation:
+  - Always call Dispose() explicitly or use 'using' / 'using var'.
+  - Call GC.SuppressFinalize(this) in Dispose() to remove from the queue.
+  - Avoid finalizers entirely when possible; use SafeHandle instead.
+  - Monitor the "Finalization Survivors" counter.
+
+6.5 Excessive Gen 2 Collections from Long-Lived Object Churn
+--------------------------------------------------------------------------------
+Description:
+  When long-lived objects (caches, connection pools, static collections)
+  are frequently modified, the GC must repeatedly scan and collect Gen 2,
+  which is the most expensive generation.
+
+Symptoms:
+  - Gen 2 collection count is disproportionately high.
+  - Gen 2 pause times dominate total GC time.
+  - "% Time in GC" is elevated.
+
+Root Causes:
+  - Cache eviction policies that constantly add/remove entries.
+  - Unbounded collections that grow and are periodically trimmed.
+  - Static dictionaries with high write rates.
+
+Mitigation:
+  - Use fixed-size data structures (ring buffers, object pools).
+  - Reduce the size of cached objects.
+  - Consider off-heap storage for large caches (memory-mapped files,
+    native memory via NativeMemory.Alloc).
+  - Use weak references (WeakReference<T>) for optional caches.
+
+================================================================================
+7. ADVANCED TECHNIQUES
+================================================================================
+
+7.1 Using GC.RegisterForFullGCNotification for Proactive Load Balancing
+--------------------------------------------------------------------------------
+
+.NET provides a mechanism to receive advance notice before a full (Gen 2)
+GC occurs. This allows the application to proactively shed load or redirect
+traffic before a potentially long pause.
+
+Requirements:
+  - Concurrent GC must be DISABLED (this API is incompatible with
+    background GC).
+  - Set via: GCSettings.LatencyMode = GCLatencyMode.Batch; or
+    <ConcurrentGC>false</ConcurrentGC> in runtimeconfig.
+
+Usage pattern:
+
+  // Register: thresholds are 1-99, representing how "full" the generation
+  // must be before notification fires. Lower = earlier warning.
+  GC.RegisterForFullGCNotification(
+      maxGenerationThreshold: 10,  // Gen 2 is 10% toward triggering
+      largeObjectHeapThreshold: 10 // LOH is 10% toward triggering
+  );
+
+  // Monitor in a background thread:
+  Task.Run(() =>
+  {
+      while (true)
+      {
+          GCNotificationStatus status = GC.WaitForFullGCApproach();
+          if (status == GCNotificationStatus.Succeeded)
+          {
+              // Full GC is approaching. Take action:
+              // - Remove this server from the load balancer
+              // - Drain in-flight requests
+              // - Log a warning
+              Console.WriteLine("Full GC approaching - shedding load");
+          }
+
+          status = GC.WaitForFullGCComplete();
+          if (status == GCNotificationStatus.Succeeded)
+          {
+              // Full GC has completed. Resume normal operation:
+              // - Re-add to load balancer
+              Console.WriteLine("Full GC complete - resuming");
+          }
+      }
+  });
+
+Limitations:
+  - Only works with non-concurrent (blocking) GC.
+  - The notification is best-effort; timing is approximate.
+  - Primarily useful for server farms where individual nodes can be
+    temporarily removed from rotation.
+
+7.2 Correlating GC Pauses with Application Latency Spikes
+--------------------------------------------------------------------------------
+
+GC pauses are a common cause of latency outliers (P99/P99.9 spikes). To
+prove the correlation, you need to align GC event timestamps with
+application-level latency measurements.
+
+Approach 1: Timestamp Correlation
+
+  1. Instrument your application to log request start/end timestamps
+     with high-resolution timing (Stopwatch.GetTimestamp()).
+  2. Capture a GC trace simultaneously.
+  3. Export GC event timestamps from PerfView (right-click -> Export).
+  4. Join the two datasets on overlapping time windows.
+  5. Requests whose execution window overlaps a GC pause are candidates
+     for GC-induced latency.
+
+Approach 2: EventListener In-Process
+
+  Use System.Diagnostics.Tracing.EventListener to subscribe to GC events
+  in-process and record them alongside application metrics:
+
+  public class GCEventListener : EventListener
+  {
+      protected override void OnEventSourceCreated(EventSource source)
+      {
+          if (source.Name == "Microsoft-Windows-DotNETRuntime")
+          {
+              EnableEvents(source, EventLevel.Informational,
+                  (EventKeywords)0x1); // GC keyword
+          }
+      }
+
+      protected override void OnEventWritten(EventWrittenEventArgs e)
+      {
+          if (e.EventName == "GCStart_V2" || e.EventName == "GCEnd_V1")
+          {
+              // Log to your metrics system with timestamp
+              // Fields: e.Payload[0] = GC count, e.Payload[1] = generation
+          }
+      }
+  }
+
+Approach 3: dotnet-monitor
+
+  For production environments, dotnet-monitor provides a REST API to
+  collect GC metrics and traces on demand without SSH access:
+
+  dotnet tool install --global dotnet-monitor
+  dotnet-monitor collect
+
+  Then query: GET /metrics (Prometheus format) or POST /trace for
+  on-demand trace capture.
+
+7.3 Using EventPipe in Production with Minimal Overhead
+--------------------------------------------------------------------------------
+
+EventPipe is designed for production use with controllable overhead. The
+key is to limit the events you collect.
+
+Minimal GC-only collection (lowest overhead):
+
+  dotnet-trace collect \
+    --providers Microsoft-Windows-DotNETRuntime:0x1:4 \
+    -p <PID> \
+    --duration 00:01:00
+
+  Keywords 0x1 = GC only. Level 4 = Informational (excludes verbose
+  per-object events). This typically adds < 1% CPU overhead.
+
+Medium detail (GC + allocation ticks):
+
+  dotnet-trace collect \
+    --providers Microsoft-Windows-DotNETRuntime:0x200001:5 \
+    -p <PID>
+
+  Keywords 0x200001 = GC (0x1) + GCAllocationTick (0x200000).
+  Allocation ticks fire every ~100 KB of allocation and include the
+  allocating type name. Moderate overhead (1-3% CPU).
+
+High detail (GC + allocation stacks, NOT for production):
+
+  dotnet-trace collect \
+    --providers Microsoft-Windows-DotNETRuntime:0x200001:5 \
+    --providers Microsoft-DotNETCore-SampleProfiler \
+    -p <PID>
+
+  Adding the SampleProfiler enables call stack collection. This has
+  significant overhead (5-15% CPU) and should only be used in staging
+  or during short diagnostic windows.
+
+Environment variable configuration (no external tool needed):
+
+  For containerized or headless environments, you can configure EventPipe
+  via environment variables at startup:
+
+  DOTNET_EnableEventPipe=1
+  DOTNET_EventPipeOutputPath=/tmp/trace.nettrace
+  DOTNET_EventPipeCircularMB=256
+  DOTNET_EventPipeConfig=Microsoft-Windows-DotNETRuntime:0x1:4
+
+  This writes a circular buffer trace file that can be collected after
+  the process exits or by copying the file during execution.
+
+Overhead guidelines:
+  - GC events only (0x1, level 4):        < 1% CPU, < 5 MB/min trace size
+  - GC + allocation ticks (0x200001):      1-3% CPU, 10-50 MB/min
+  - GC + stacks + sampling:               5-15% CPU, 50-200 MB/min
+
+Always test the overhead impact in a staging environment before enabling
+tracing in production.
+
+================================================================================
+REFERENCES
+================================================================================
+
+  - "Pro .NET Memory Management" by Konrad Kokosa (Apress)
+  - Microsoft Docs: "Garbage Collection Design"
+    https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/
+  - PerfView Tutorial: "GC Stats"
+    https://learn.microsoft.com/en-us/shows/perfview-tutorial/
+  - Maoni Stephens' Blog (GC architect):
+    https://maoni0.medium.com/
+  - dotnet-trace documentation:
+    https://learn.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-trace
+  - .NET GC ETW Events Reference:
+    https://learn.microsoft.com/en-us/dotnet/fundamentals/diagnostics/
+    runtime-garbage-collection-events
+
+================================================================================
+END OF EXERCISE 06 GUIDANCE DOCUMENT
+================================================================================

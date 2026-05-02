@@ -1,0 +1,59 @@
+================================================================================
+  Chapter 12, Exercise 05: Kestrel Pipelines Analysis
+================================================================================
+
+Objective
+---------
+Study how Kestrel uses System.IO.Pipelines in industrial-grade HTTP request
+processing.
+
+Analysis Targets
+----------------
+  1. How HttpConnection creates and configures Pipe instances.
+  2. How protocol parsing is delegated to HTTP/1.x connection logic.
+  3. How backpressure propagates through request reading and response writing.
+  4. Which patterns are reusable in your own high-performance servers.
+
+Suggested Source Areas
+----------------------
+Search the ASP.NET Core repository for:
+
+  - HttpConnection
+  - Http1Connection
+  - MessageBody
+  - TransportConnection
+  - PipeOptions
+  - PauseWriterThreshold / ResumeWriterThreshold
+  - Input / Output pipe setup
+  - ConnectionContext
+  - IDuplexPipe
+  - Transport.Input / Transport.Output
+  - Application.Input / Application.Output
+
+Note: Pay attention to the IDuplexPipe abstractions (for example,
+Transport.Input/Output versus Application.Input/Output) to understand
+how Kestrel bridges the underlying socket with the HTTP protocol layer.
+
+Recommended Reading Procedure
+-----------------------------
+  1. Start from connection acceptance and trace where transport I/O is attached
+     to Kestrel connection objects.
+  2. Identify where PipeReader/PipeWriter are exposed to protocol code.
+  3. Follow the HTTP/1 parser loop and note how consumed/examined are advanced.
+  4. Inspect where Kestrel stops reading or slows writing under pressure.
+  5. Summarize the design patterns rather than copying implementation details.
+
+Report Template
+---------------
+Produce a concise report with sections like:
+
+  - Connection bootstrap and Pipe configuration
+  - Parsing loop structure
+  - Multi-stage ownership of buffers
+  - Backpressure propagation path
+  - Lessons for custom server design
+
+Expected Outcome
+----------------
+A short technical report that explains how Kestrel applies Pipelines in a
+production-grade server and what engineering choices make that approach robust.

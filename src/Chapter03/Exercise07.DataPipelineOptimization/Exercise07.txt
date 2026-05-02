@@ -1,0 +1,244 @@
+============================================================================
+Exercise 07 — Comprehensive Case: Optimizing a Data Processing Pipeline
+============================================================================
+
+OBJECTIVE
+
+  This exercise is an open-ended capstone for Chapter 3. You will build a
+  simple data processing pipeline from scratch, then iteratively optimize
+  it by applying the hardware-aware techniques covered in this chapter:
+  cache-friendly data layout, branchless logic, blocked processing, and
+  false-sharing-aware parallelism.
+
+  The goal is not a single "correct answer" but a measured journey from a
+  naive baseline to a highly optimized implementation, with benchmark data
+  justifying every change.
+
+
+SUGGESTED APPLICATION STRUCTURE
+
+  Define a dataset of N records (start with N = 10,000,000). Each record
+  contains the following fields:
+
+      Id          int       Unique identifier
+      Category    byte      Enum-like value in range [0, 15]
+      Value       double    Random floating-point number in [0, 1000)
+      Timestamp   long      Unix timestamp in milliseconds
+
+  The pipeline has three stages executed in sequence:
+
+    1. FILTER    — Keep only records where Value > threshold (e.g., 500.0).
+                   Roughly 50% of records survive on uniform random data.
+
+    2. TRANSFORM — For each surviving record, compute:
+                       Value = sqrt(Value) * 2.5 + 1.0
+                   This simulates a lightweight math transformation.
+
+    3. AGGREGATE — Group surviving records by Category and compute:
+                       - Count per category
+                       - Sum of transformed values per category
+                       - Average of transformed values per category
+
+  The final output is a summary array of 16 entries (one per category).
+
+
+STEP-BY-STEP OPTIMIZATION ROADMAP
+
+  Work through the steps below in order. After each step, benchmark the
+  new version against the baseline and record the results.
+
+  --------------------------------------------------------------------------
+  Step 0: Naive Baseline
+  --------------------------------------------------------------------------
+
+    - Define a Record class with all four fields.
+    - Store records in a List<Record>.
+    - Implement the pipeline using LINQ:
+
+          records.Where(r => r.Value > threshold)
+                 .Select(r => new { r.Category, V = Math.Sqrt(r.Value) * 2.5 + 1.0 })
+                 .GroupBy(r => r.Category)
+                 .Select(g => new { Category = g.Key, Sum = g.Sum(x => x.V) })
+
+    - This version is readable but allocates heavily (enumerator objects,
+      anonymous types, grouping buffers) and scatters memory accesses
+      across heap-allocated Record objects.
+
+    - Measure: throughput, GC Gen0/Gen1/Gen2 collections, total allocated.
+
+  --------------------------------------------------------------------------
+  Step 1: Data-Oriented Design (AoS to SoA)
+  --------------------------------------------------------------------------
+
+    - Replace the class-based list with parallel arrays:
+
+          int[]    ids        = new int[N];
+          byte[]   categories = new byte[N];
+          double[] values     = new double[N];
+          long[]   timestamps = new long[N];
+
+    - Rewrite the pipeline as simple for-loops over these arrays.
+    - The filter stage now touches only the values[] array, which is
+      contiguous in memory. The CPU prefetcher can stream it efficiently.
+    - The aggregate stage touches only categories[] and the filtered
+      values — no need to pull entire Record objects into cache.
+
+    - Why it helps: each pipeline stage accesses only the fields it needs.
+      Cache lines are no longer wasted on irrelevant fields.
+
+    - Expected improvement over baseline: 2-3x throughput, near-zero GC.
+
+  --------------------------------------------------------------------------
+  Step 2: Branchless Filtering
+  --------------------------------------------------------------------------
+
+    - The naive filter uses an if-branch to test each value. When the data
+      is random, the branch predictor has roughly 50% accuracy — the worst
+      case for branch misprediction penalties.
+
+    - Replace the branch with an arithmetic mask. One approach:
+
+          // Produce 0 or 1 without branching
+          long bits = BitConverter.DoubleToInt64Bits(value - threshold);
+          int  pass = (int)((~bits) >>> 63);   // 1 if value > threshold
+
+      Use the mask to conditionally store the index into a filtered-index
+      array via a branchless compaction pattern:
+
+          filteredIndices[outCount] = i;
+          outCount += pass;
+
+      The store always executes, but outCount only advances when the
+      record passes the filter. This avoids branch mispredictions entirely.
+
+    - Why it helps: eliminates the ~5-15 cycle misprediction penalty that
+      occurs on roughly half of all iterations with random data.
+
+    - Expected improvement over Step 1: 10-30% on uniformly random data.
+      (The benefit shrinks if data is sorted or nearly all pass/fail.)
+
+  --------------------------------------------------------------------------
+  Step 3: Blocked (Tiled) Processing
+  --------------------------------------------------------------------------
+
+    - Instead of running each stage over the entire array before starting
+      the next stage, process the data in blocks of B elements (e.g.,
+      B = 4096).
+
+    - For each block:
+        a. Filter the block  (reads values[], writes local index buffer)
+        b. Transform the filtered values in-place
+        c. Accumulate into the per-category aggregates
+
+    - The key insight: a block of 4096 doubles is 32 KB, which fits
+      comfortably in L1 data cache (typically 32-48 KB). By the time
+      stage (c) reads the transformed values, they are still in L1 —
+      no round-trip to L2 or L3.
+
+    - Without blocking, the transform stage writes 10 million doubles
+      (~80 MB) before the aggregate stage reads them. That data has long
+      been evicted from L1 by the time aggregation begins.
+
+    - Why it helps: keeps the working set in the fastest cache level.
+
+    - Expected improvement over Step 2: 10-20%.
+
+  --------------------------------------------------------------------------
+  Step 4: Parallel Processing (False-Sharing Aware)
+  --------------------------------------------------------------------------
+
+    - Partition the input arrays into T roughly equal chunks, where T is
+      the number of available cores (Environment.ProcessorCount).
+
+    - Each thread processes its chunk independently through all three
+      stages (filter, transform, aggregate) using the blocked approach
+      from Step 3.
+
+    - Critical detail: each thread must accumulate into its OWN local
+      result array, not a shared one. If two threads write to adjacent
+      memory (e.g., adjacent slots in a shared aggregation array), they
+      will thrash the same cache line back and forth between cores. This
+      is false sharing, and it can make parallel code slower than serial.
+
+    - Pad each thread's accumulator to a full cache line (64 bytes) or
+      allocate separate arrays. After all threads finish, merge the
+      partial results in a single-threaded pass.
+
+    - Use Parallel.For, Task, or manual threads — your choice. Avoid
+      locking on the hot path.
+
+    - Why it helps: modern CPUs have 4-16+ cores sitting idle in a
+      single-threaded pipeline. This step exploits them.
+
+    - Expected improvement over Step 3: near-linear scaling with core
+      count (e.g., 4x on a 4-core machine, 8x on 8 cores).
+
+
+MEASUREMENT METHODOLOGY
+
+  Use BenchmarkDotNet for all measurements. Annotate your benchmark class
+  with [MemoryDiagnoser] to capture allocation data.
+
+  For each step, record at minimum:
+
+    - Throughput       (millions of records per second)
+    - Mean time        (milliseconds per pipeline run)
+    - GC Gen0/1/2      (collections per operation)
+    - Allocated bytes  (per operation)
+
+  Run each benchmark long enough for stable results (BenchmarkDotNet
+  handles warmup and iteration count automatically).
+
+  Compare every step against Step 0 (the baseline) to compute cumulative
+  speedup.
+
+
+REPORT TEMPLATE
+
+  Present your results in a table like this:
+
+  +--------+---------------------------+------------+---------+-----------+
+  | Step   | Technique                 | Throughput  | Speedup | GC Alloc  |
+  |        |                           | (Mrec/s)   | (cum.)  | (MB/op)   |
+  +--------+---------------------------+------------+---------+-----------+
+  | 0      | Naive (LINQ + classes)    |    ???      |  1.0x   |   ???     |
+  | 1      | SoA + for-loops           |    ???      |  ???x   |   ???     |
+  | 2      | + Branchless filter       |    ???      |  ???x   |   ???     |
+  | 3      | + Blocked processing      |    ???      |  ???x   |   ???     |
+  | 4      | + Parallel (T threads)    |    ???      |  ???x   |   ???     |
+  +--------+---------------------------+------------+---------+-----------+
+
+  Fill in the ??? entries with your measured values. Include a brief
+  paragraph after the table discussing which step yielded the largest
+  improvement and why.
+
+
+KEY TAKEAWAYS
+
+  1. Data layout matters more than algorithmic cleverness at this scale.
+     Switching from AoS to SoA (Step 1) often delivers the single largest
+     speedup because it fundamentally changes how the CPU cache is used.
+
+  2. Each optimization targets a specific hardware bottleneck:
+       - Step 1: cache utilization (spatial locality)
+       - Step 2: branch predictor pressure
+       - Step 3: cache residency (temporal locality)
+       - Step 4: multi-core utilization and cache coherence
+
+  3. Measure before and after. Intuition about performance is often wrong.
+     A technique that sounds impressive may yield negligible improvement on
+     your specific data and hardware, while a "boring" layout change may
+     double throughput.
+
+  4. The cumulative effect of small, targeted improvements can be dramatic.
+     It is realistic to achieve 10-50x total speedup over the naive
+     baseline by the end of this exercise, depending on hardware.
+
+  5. Optimization is a dialogue with the hardware. Use profiling tools
+     (perf counters, CPU cache miss rates, branch misprediction stats) to
+     confirm that each step is solving the bottleneck you think it is.
+
+
+============================================================================
+  End of Exercise 07 Guidance
+============================================================================

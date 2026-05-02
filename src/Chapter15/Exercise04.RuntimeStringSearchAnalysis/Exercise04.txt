@@ -1,0 +1,67 @@
+Exercise 04 — Runtime String Search SIMD Analysis
+===============================================
+
+Goal
+----
+Study how dotnet/runtime implements high-performance string and span searching
+with SIMD-aware helper routines.
+
+Why this exercise is guidance-only
+----------------------------------
+The real educational value comes from reading the production source, following the
+architecture branches, and connecting the algorithmic structure with the emitted
+instructions. A miniature reimplementation would hide many of the engineering
+tradeoffs that make the runtime code interesting.
+
+Suggested source targets
+------------------------
+Inspect the dotnet/runtime repository and search for:
+
+  - String.IndexOf
+  - SpanHelpers.IndexOf
+  - PackedSpanHelpers
+  - SearchValues
+  - MoveMask
+  - TrailingZeroCount
+  - Vector128 / Vector256
+  - Sse2 / Avx2 / AdvSimd
+
+Recommended reading procedure
+-----------------------------
+1. Start from the public String.IndexOf overloads and identify where they delegate
+   into span-based helpers.
+2. Trace the hot path for searching a single character versus multiple candidate
+   characters.
+3. Look for vectorized loops that compare many bytes or chars at once.
+4. Identify where movemask-style extraction or bitmask generation is used to
+   convert lane matches into a scalar index.
+5. Note how the implementation branches by input length and by hardware support.
+6. Compare the x86 path with the ARM path and record the shared ideas versus the
+   ISA-specific details.
+
+Points to extract in your report
+--------------------------------
+Your technical summary should explain:
+
+  1. How bulk comparisons reduce the number of scalar character checks.
+  2. How a vector compare result becomes a bitmask.
+  3. How TrailingZeroCount helps locate the first matching lane quickly.
+  4. Why different search strategies are used for short inputs versus long inputs.
+  5. How the runtime keeps portable fallbacks while still exploiting ISA-specific
+     instructions.
+  6. Which parts of the design are algorithmic and which are architecture-specific.
+
+Suggested report outline
+------------------------
+- Entry points and helper layering
+- Single-character search fast path
+- Multi-character or pattern search strategy
+- Bitmask extraction and first-match location
+- x86 and ARM implementation differences
+- Portability and maintenance lessons
+
+Expected outcome
+----------------
+A concise but technical report describing how the .NET runtime turns character
+search into SIMD-friendly bulk comparison, then maps vector match bits back to the
+first scalar index efficiently.

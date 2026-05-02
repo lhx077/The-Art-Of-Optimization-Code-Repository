@@ -1,0 +1,99 @@
+===========================================================================
+ Exercise 05 — Distributed Tracing with OpenTelemetry
+ The Art of Optimization (TAOO) — Chapter 02
+===========================================================================
+
+ OVERVIEW
+---------------------------------------------------------------------------
+This exercise contains two ASP.NET Core microservices that demonstrate
+OpenTelemetry distributed tracing. ServiceA (port 5001) acts as a gateway
+that receives user requests and forwards them to ServiceB (port 5002),
+which simulates an inventory service. Both services emit trace spans to
+the console, allowing you to observe how a single TraceId flows across
+service boundaries via the W3C Trace Context propagation standard.
+
+
+ RUNNING THE SERVICES
+---------------------------------------------------------------------------
+Open two separate terminal windows and start each service:
+
+  Terminal 1 (ServiceA — Gateway):
+    cd src/Chapter02/Exercise05.DistributedTracing/ServiceA
+    dotnet run
+
+  Terminal 2 (ServiceB — Inventory):
+    cd src/Chapter02/Exercise05.DistributedTracing/ServiceB
+    dotnet run
+
+ServiceA must be able to reach ServiceB at http://localhost:5002.
+Start ServiceB first to avoid connection errors on the first request.
+
+
+ TESTING WITH CURL
+---------------------------------------------------------------------------
+Once both services are running, issue requests against ServiceA:
+
+  curl http://localhost:5001/api/orders
+  curl http://localhost:5001/api/orders/42
+  curl http://localhost:5001/api/health
+
+
+ WHAT TO OBSERVE
+---------------------------------------------------------------------------
+After each request, both terminals will print span data to the console.
+Look for the following:
+
+  1. Matching TraceId — The 32-character hex TraceId printed in ServiceA's
+     output will appear identically in ServiceB's output, proving that
+     both services participate in the same distributed trace.
+
+  2. Parent-child relationships — ServiceB's incoming HTTP span will have
+     a ParentSpanId that matches ServiceA's outgoing HttpClient span.
+
+  3. Custom span tags — Tags like "user.id", "order.type", and
+     "inventory.items_checked" appear in the span output, demonstrating
+     how business context is attached to trace data.
+
+  4. Error spans — Approximately 20% of /api/inventory/check calls will
+     fail, producing spans with Status = Error. The /api/inventory/{id}
+     endpoint flags spans as errors when the simulated delay exceeds
+     400ms, demonstrating timeout detection at the tracing level.
+
+
+ W3C TRACE CONTEXT PROPAGATION
+---------------------------------------------------------------------------
+The trace context is propagated via the "traceparent" HTTP header, which
+follows this format:
+
+  traceparent: 00-<trace-id>-<parent-span-id>-<trace-flags>
+
+  Example: traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+  - Version (00): always "00" in the current specification.
+  - TraceId (32 hex chars): unique identifier for the entire trace.
+  - ParentSpanId (16 hex chars): the span that initiated the call.
+  - TraceFlags (01): "01" means the trace is sampled (recorded).
+
+The HttpClient instrumentation in ServiceA injects this header
+automatically. The ASP.NET Core instrumentation in ServiceB extracts it
+automatically. No manual header manipulation is required.
+
+
+ OPTIONAL: JAEGER VISUALIZATION
+---------------------------------------------------------------------------
+For a graphical trace waterfall view, run Jaeger via Docker:
+
+  docker run -d --name jaeger \
+    -p 16686:16686 \
+    -p 4317:4317 \
+    jaegertracing/all-in-one:latest
+
+Then replace AddConsoleExporter() with AddOtlpExporter() in both
+Program.cs files and add the OTLP exporter NuGet package:
+
+  dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
+
+Open http://localhost:16686 in your browser to view traces with full
+waterfall diagrams, span details, and cross-service dependency graphs.
+
+===========================================================================

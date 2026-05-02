@@ -1,0 +1,63 @@
+Exercise 05 — Dynamic PGO Investigation
+=======================================
+
+Goal
+----
+Observe how dynamic profile-guided optimization changes code quality after the
+runtime collects execution data.
+
+Why this exercise is guidance-only
+----------------------------------
+Dynamic PGO behavior depends heavily on runtime version, environment variables,
+process lifetime, and workload shape. A fixed demo can illustrate the idea, but
+the most valuable learning comes from running targeted experiments and comparing
+results under different runtime settings.
+
+Recommended setup
+-----------------
+1. Build a small benchmark with:
+   - a hot branch where one path is taken much more often than the other
+   - an interface or virtual call site dominated by one concrete type
+   - enough warm-up iterations for tiered recompilation to happen
+2. Prepare two runs:
+   - default runtime settings
+   - dynamic PGO disabled
+3. Capture both timing and generated code when possible.
+
+Suggested environment toggles
+-----------------------------
+Use runtime settings that let you compare adaptive behavior clearly. Common ones
+include enabling or disabling tiered compilation and dynamic PGO for the process.
+Keep the exact commands in your local notes because runtime switches may evolve
+between .NET releases.
+
+What to observe
+---------------
+1. Does throughput improve after warm-up?
+2. Do branch-heavy loops become more stable after repeated execution?
+3. Does a virtual or interface call become devirtualized in later codegen?
+4. Does the generated assembly differ between the baseline run and the warmed-up
+   run?
+
+Report template
+---------------
+- Runtime version:
+- CPU architecture:
+- Workload summary:
+- Warm-up strategy:
+- Baseline result:
+- Dynamic PGO result:
+- Assembly differences observed:
+- Interpretation:
+
+Interpretation guide
+--------------------
+If dynamic PGO helps, the reason is usually not magic. It often means the JIT
+learned that:
+- one branch is much more likely than another
+- one concrete type dominates a polymorphic call site
+- a particular code path is hot enough to justify stronger optimization
+
+If no difference appears, that is also meaningful. It may indicate that the test
+is too small, not hot enough, already simple enough, or limited by something the
+JIT cannot improve much.

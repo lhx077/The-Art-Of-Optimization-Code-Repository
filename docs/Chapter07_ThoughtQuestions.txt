@@ -1,0 +1,292 @@
+================================================================================
+Chapter 07 — Delegates, Reflection, and Metaprogramming Performance:
+              Thought Question Answers
+================================================================================
+
+
+Question 1: How do delegate, interface, and reflection-based strategy
+pattern implementations compare in terms of call overhead, allocation,
+and runtime flexibility?
+--------------------------------------------------------------------------------
+
+Implementing the strategy pattern in a performance-critical hot path
+requires careful consideration of the invocation mechanism, because the
+abstraction chosen to represent the interchangeable algorithm directly
+determines per-call overhead, memory allocation behavior, and the degree
+of runtime flexibility available to the application. The three primary
+mechanisms in .NET — delegates, interfaces, and reflection — occupy
+distinct positions along the performance-flexibility spectrum, and
+selecting among them demands an understanding of what the JIT compiler
+can and cannot optimize.
+
+A direct or cached delegate invocation incurs approximately one to two
+nanoseconds of overhead per call. The delegate object contains a function
+pointer and a target reference; invoking it requires an indirect call
+through the function pointer, which the processor's branch predictor
+handles efficiently once the call site stabilizes. The delegate instance
+itself is a single heap allocation that can be performed once at startup
+and reused indefinitely, making the amortized allocation cost negligible.
+When the strategy is fixed at application startup, caching the delegate
+in a static or instance field eliminates all per-call allocation and
+provides the simplest possible invocation path. Swapping strategies at
+runtime is equally straightforward: reassigning the delegate field is an
+O(1) operation that takes effect immediately on the next invocation.
+
+An interface-based strategy introduces virtual dispatch through the
+virtual method table, which also costs approximately one to two
+nanoseconds per call — effectively identical to delegate invocation on
+modern hardware. If the implementation is a singleton, no per-call
+allocation occurs. The JIT compiler can further optimize interface
+dispatch through devirtualization: when only a single implementation of
+the interface is loaded into the application domain, the JIT may replace
+the virtual call with a direct call and potentially inline the method
+body entirely, reducing overhead to zero. This makes interfaces the most
+idiomatic and maintainable choice in C# for strategy patterns where the
+number of implementations is small and known at compile time. Swapping
+the implementation at runtime requires reassigning the interface
+reference, which is the same O(1) cost as delegate reassignment.
+
+Reflection-based invocation via MethodInfo.Invoke occupies the opposite
+end of the spectrum. Each call incurs one hundred to one thousand times
+the overhead of a delegate or interface call, because the runtime must
+perform parameter validation, box value-type arguments into an object
+array, execute security checks, and bypass JIT optimizations that depend
+on static type knowledge. The object array allocation occurs on every
+invocation, generating sustained garbage collector pressure in a hot
+path. Reflection should therefore be reserved for genuinely dynamic
+scenarios — plugin systems that discover and load strategies from
+external assemblies at runtime, or scripting engines that must invoke
+arbitrary methods by name. For such cases, a hybrid approach is strongly
+recommended: use reflection or expression trees to discover and compile
+a delegate once during initialization, then invoke the cached delegate
+in the hot path. This technique, sometimes called "reflection once,
+delegate forever," combines reflection's flexibility with delegate-level
+invocation speed and is the standard pattern in high-performance
+serialization libraries and dependency injection containers.
+
+
+Question 2: How many hidden heap allocations does a LINQ query with a
+captured-variable lambda produce inside a loop, and how can they be
+eliminated?
+--------------------------------------------------------------------------------
+
+Analyzing the allocation behavior of a code pattern in which an outer
+loop iterates ten thousand times and each iteration executes a LINQ
+query containing a lambda that captures a method parameter reveals a
+surprisingly large number of hidden heap allocations. Understanding
+where these allocations originate requires tracing the compiler's
+transformation of the lambda expression and the runtime behavior of each
+LINQ operator.
+
+When the C# compiler encounters the lambda expression
+x => x.Value > threshold, it detects that threshold is a captured
+variable from the enclosing scope. The compiler generates a closure
+class — a hidden class containing a field for threshold and a method
+implementing the lambda body. An instance of this closure class must be
+allocated on the heap so that the lambda can reference the captured
+value. In principle, if threshold does not change across iterations, the
+compiler could reuse a single closure instance. However, the delegate
+object that wraps the closure method — the Func<Item, bool> instance
+passed to the Where operator — is a separate heap allocation. In
+practice, the Roslyn compiler allocates both the closure and the
+delegate per invocation of the enclosing method or per loop iteration,
+depending on the scope of the captured variable.
+
+Beyond the closure and delegate, each LINQ operator in the chain
+contributes its own allocations. The Where operator returns a
+WhereEnumerableIterator<Item>, which is a heap-allocated iterator state
+machine. The ToList call allocates a new List<Item> object and its
+internal backing array, sized to accommodate the filtered results. If
+the filtered set contains elements, the array may be resized during
+population, generating additional discarded arrays. Summing these
+contributions for a single outer iteration yields a minimum of three to
+four heap allocations: the delegate, the Where iterator, the List, and
+the List's internal array. Over ten thousand outer iterations, this
+produces thirty thousand to forty thousand allocations — a volume
+sufficient to trigger frequent generation-zero garbage collections and
+measurably degrade throughput.
+
+The critical insight, however, is that the filtered list does not depend
+on the loop variable item from the outer foreach. The LINQ query
+produces an identical result on every iteration, making the entire inner
+computation redundant. The most impactful optimization is therefore
+algorithmic: hoist the filtering operation outside the loop so that it
+executes exactly once. Beyond this structural fix, further allocation
+reduction can be achieved by replacing the LINQ chain with a manual for
+loop that filters into a pre-allocated list, by using a static lambda
+(available in C# 9 and later) to eliminate the closure when the
+threshold can be passed through alternative means, and by employing
+ArrayPool<T> or Span<T> for the result buffer to avoid repeated List
+allocations entirely.
+
+
+Question 3: How do reflection, expression trees, and source generators
+compare for dynamic property access in a serialization library targeting
+both JIT and Native AOT?
+--------------------------------------------------------------------------------
+
+Building a serialization library that must access object properties
+dynamically presents a fundamental tension between runtime flexibility
+and ahead-of-time compilation compatibility. The three principal
+approaches — reflection, expression trees, and source generators — each
+resolve this tension differently, and a production-quality library must
+understand their tradeoffs to provide optimal performance across both
+JIT and Native AOT deployment models.
+
+Reflection through PropertyInfo.GetValue is the most universally
+compatible approach. It requires no code generation infrastructure and
+works in every .NET runtime, including Native AOT, provided that the
+target types are preserved from trimming through appropriate annotations
+such as [DynamicallyAccessedMembers]. However, each call to GetValue
+incurs approximately one hundred times the overhead of a direct property
+access because the runtime must resolve the property metadata, perform
+security checks, and box value-type return values into object
+references. The boxing allocation is particularly damaging in
+serialization scenarios where thousands of properties are accessed per
+serialization pass, generating substantial garbage collector pressure.
+Reflection is therefore acceptable only as a fallback for truly unknown
+types or for cold paths where the access occurs infrequently.
+
+Expression trees offer a compelling middle ground. A library can
+construct a LambdaExpression that reads a specific property, compile it
+into a strongly-typed delegate via Expression.Compile, and cache the
+delegate for repeated use. After the one-time compilation cost,
+subsequent invocations execute at near-native speed because the compiled
+delegate contains JIT-optimized machine code. The critical limitation is
+that Expression.Compile relies internally on Reflection.Emit to generate
+IL at runtime, and Reflection.Emit is not available in Native AOT
+environments where dynamic code generation is prohibited. A
+serialization library that depends exclusively on expression trees will
+fail at runtime when deployed as a Native AOT application.
+
+Source generators resolve the AOT compatibility problem entirely by
+shifting code generation to compile time. A source generator analyzes
+the target types during compilation and emits strongly-typed property
+access code that is indistinguishable from hand-written code in the
+final assembly. The generated accessors incur zero runtime overhead,
+require no dynamic code generation, and survive trimming without
+annotation because the generated code contains explicit references to
+the properties. The limitation is that source generators can only
+process types known at compile time; truly dynamic types discovered at
+runtime cannot be handled.
+
+The optimal architecture for a production serialization library defines
+a common interface — such as IPropertyAccessor<T> — and provides
+multiple implementations behind a factory. The factory inspects
+RuntimeFeature.IsDynamicCodeSupported at startup: when dynamic code
+generation is available, it returns expression-tree-compiled accessors
+for maximum flexibility; when it is not, it returns
+source-generator-produced accessors for AOT-safe execution. This
+unified API design allows the library to deliver near-native performance
+in both deployment models while maintaining a single public surface for
+consumers.
+
+
+Question 4: Why are frequent event += and -= operations expensive, and
+how would you design a high-performance alternative event mechanism?
+--------------------------------------------------------------------------------
+
+The standard C# event mechanism, built upon multicast delegates, provides
+a convenient and type-safe publish-subscribe pattern, but its
+implementation characteristics make frequent subscription and
+unsubscription operations surprisingly expensive. Understanding why
+requires examining the immutability invariant that governs delegate
+instances and the copying operations it necessitates.
+
+Delegates in .NET are immutable objects. When the += operator is applied
+to an event, the runtime does not modify the existing delegate in place.
+Instead, it calls Delegate.Combine, which allocates a new multicast
+delegate whose internal invocation list contains all handlers from the
+original delegate plus the newly added handler. The original delegate
+instance becomes garbage. Similarly, the -= operator calls
+Delegate.Remove, which allocates a new delegate containing all handlers
+except the removed one. Both operations are O(n) in the number of
+current subscribers because the entire invocation list must be copied
+into the new delegate instance. Under thread-safe event patterns, the
+runtime uses Interlocked.CompareExchange in a retry loop to atomically
+swap the delegate field, which adds further overhead under contention as
+multiple threads may repeatedly allocate and discard delegate instances
+before one succeeds.
+
+For systems with high-frequency subscription changes — game engines
+processing entity lifecycle events, UI frameworks managing component
+mount and unmount cycles, or real-time messaging systems with volatile
+subscriber populations — this pattern generates significant allocation
+pressure. Each subscribe-unsubscribe cycle produces two discarded
+delegate instances, and the O(n) copy cost grows linearly with
+subscriber count.
+
+A high-performance alternative replaces the immutable delegate chain
+with a mutable collection as the backing store. A List<Action<T>> or a
+fixed-size array serves as the subscriber registry, with Add and Remove
+operations modifying the collection in place. Thread safety is achieved
+through a ReaderWriterLockSlim, which permits concurrent invocations
+while serializing subscription changes, or through a copy-on-write
+strategy where the invocation path reads a snapshot reference without
+locking. For scenarios requiring weak-reference semantics — where
+subscribers should not be prevented from garbage collection — the
+backing store can hold WeakReference<Action<T>> instances, with dead
+references cleaned up lazily during invocation sweeps. This design
+reduces subscription cost to O(1) amortized, eliminates per-operation
+delegate allocation, and provides explicit control over threading
+policy. More advanced architectures employ a channel-based event bus
+using System.Threading.Channels, which decouples publishers from
+subscribers entirely and provides built-in backpressure, bounded
+buffering, and asynchronous consumption — properties that the standard
+event mechanism cannot offer.
+
+
+Question 5: Why does a generic interface constraint with a struct
+transformer outperform a Func<T, T> delegate by five to tenfold in
+tight loops?
+--------------------------------------------------------------------------------
+
+Comparing a Func<T, T> delegate parameter with a generic interface
+constraint where the transformer is a struct reveals a profound
+difference in how the JIT compiler handles value-type invocations, and
+this difference can produce a five-to-tenfold performance gap in tight
+computational loops. The mechanism responsible is struct generic
+specialization combined with devirtualization and inlining — a trio of
+optimizations that the delegate-based approach structurally cannot
+benefit from.
+
+When a method accepts a Func<T, T> parameter, the delegate is a
+reference-type object residing on the heap. It contains a pointer to
+the target method and a reference to the target object (or null for
+static methods). Invoking the delegate requires an indirect call through
+the function pointer, which the processor must resolve at runtime. The
+JIT compiler cannot inline through this indirect call because the target
+method is not statically known at the call site — any method with a
+matching signature could be behind the delegate. For value types such as
+int or double, the transformation logic remains behind an opaque
+indirect call on every iteration, and the delegate object itself
+represents a heap allocation that must be performed at least once and
+cached.
+
+The generic interface constraint approach — where TTransformer : struct,
+ITransformer<T> — exploits a fundamentally different compilation model.
+When the JIT compiler encounters a generic method instantiated with a
+specific struct type, it generates a completely new native code
+specialization for that struct. Because the struct type is known at JIT
+compilation time and structs cannot be subclassed, the compiler knows
+exactly which implementation of the Transform method will be called. It
+can therefore devirtualize the interface call into a direct call and,
+because the method body is now statically known, inline it directly into
+the calling loop. The struct itself, being a value type, is passed in
+registers or on the stack with zero heap allocation. The net effect is
+that the transformer logic is woven directly into the loop body as if it
+had been written inline by the programmer, eliminating all call
+overhead, all indirection, and all allocation.
+
+This pattern is not merely theoretical. The .NET runtime itself relies
+on it extensively: Span<T>.Sort accepts an IComparer<T> constraint, and
+when a struct comparer is provided, the comparison logic is inlined into
+the sort algorithm, achieving performance comparable to hand-specialized
+sorting code. The Array.Sort and List<T>.Sort methods benefit from the
+same optimization. The only caveat is code size: each unique struct type
+parameter causes the JIT to emit a separate native code body for the
+generic method, which increases the working set of executable code in
+memory. For a small number of transformer types — the common case in
+practice — this cost is negligible. For scenarios involving hundreds of
+unique struct types, the increased instruction cache pressure may offset
+the inlining benefit, and profiling should guide the decision.

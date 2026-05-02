@@ -1,0 +1,29 @@
+================================================================================
+  Chapter 10, Exercise 05: HTTP Response Builder
+================================================================================
+
+Objective
+---------
+Implement an HTTP response builder using IBufferWriter<byte>.
+
+Required Features
+-----------------
+  - Set status code and reason phrase.
+  - Add multiple headers.
+  - Write a response body.
+  - Automatically emit Content-Length for buffered responses.
+  - Support chunked transfer encoding.
+
+Comparison Task
+---------------
+Compare the builder with a simpler StringBuilder + Encoding approach.
+Measure:
+  - Throughput
+  - Allocated bytes
+  - Relative complexity tradeoff
+
+Notes
+-----
+  - HTTP headers should be ASCII-safe.
+  - Body content is typically UTF-8.
+  - Chunked mode writes: <hex-length> CRLF <bytes> CRLF ... 0 CRLF CRLF

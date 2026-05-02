@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "Exercise03.NativeAotMinimalApi": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:55310;http://localhost:55311"
+    }
+  }
+}

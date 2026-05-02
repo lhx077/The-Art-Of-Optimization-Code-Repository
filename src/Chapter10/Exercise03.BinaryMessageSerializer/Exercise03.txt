@@ -1,0 +1,30 @@
+================================================================================
+  Chapter 10, Exercise 03: Binary Message Serializer
+================================================================================
+
+Objective
+---------
+Implement a binary chat message codec using:
+
+  - IBufferWriter<byte> for encoding
+  - SequenceReader<byte> for decoding
+
+Required fields:
+  - UserId (int)
+  - Timestamp (long)
+  - MessageType (byte)
+  - Message content (variable-length UTF-8 string)
+
+Checklist
+---------
+  1. Define a stable binary message layout.
+  2. Encode into IBufferWriter<byte> without intermediate byte[] creation.
+  3. Decode from ReadOnlySequence<byte> using SequenceReader<byte>.
+  4. Validate correctness with round-trip tests.
+  5. Benchmark encode/decode throughput.
+
+Notes
+-----
+  - Prefer BinaryPrimitives for endian-aware integer writes.
+  - Prefer a length-prefixed UTF-8 payload for straightforward framing.
+  - For segmented sequences, avoid assuming IsSingleSegment.

@@ -1,0 +1,58 @@
+Exercise 03 — Perform a Full Application Performance Analysis
+==============================================================
+
+Goal
+----
+Run a structured investigation on an existing .NET application, identify the
+highest-value optimization targets, and verify improvements with measurement.
+
+Recommended process
+-------------------
+1. Choose a representative workload.
+   The analysis is only useful if the workload resembles real production usage.
+
+2. Collect CPU and memory traces.
+   Tools such as PerfView or dotTrace can help answer:
+   - where CPU time is spent
+   - which call stacks allocate the most memory
+   - where GC pressure comes from
+   - whether blocking or waiting dominates response time
+
+3. Separate symptoms from root causes.
+   Example:
+   - symptom: high latency
+   - root cause: N+1 query pattern
+
+   Or:
+   - symptom: heavy GC activity
+   - root cause: repeated short-lived string allocation in a formatter
+
+4. Create an optimization backlog.
+   For each candidate item, record:
+   - expected benefit
+   - implementation cost
+   - technical risk
+   - maintainability impact
+
+5. Rank by benefit-to-cost ratio.
+   Do not automatically choose the most “interesting” optimization. Choose the
+   one that gives the best practical return.
+
+6. Implement the top three items.
+   Keep the changes isolated enough that each optimization can be measured.
+
+7. Re-benchmark after each change.
+   Confirm that the intended scenario improved and that no important secondary
+   metric regressed.
+
+Deliverables
+------------
+- CPU profile summary
+- allocation profile summary
+- ranked optimization backlog
+- before/after benchmark results for the chosen improvements
+
+Success criteria
+----------------
+A good outcome is not just “the app is faster.” A good outcome is that the team
+can explain why it became faster and prove which changes mattered.

@@ -1,0 +1,59 @@
+Exercise 02 — Create a Performance Review Checklist
+===================================================
+
+Goal
+----
+Create a lightweight checklist that helps reviewers catch common performance
+risks during normal code review.
+
+Suggested structure
+-------------------
+Split the checklist into two groups:
+
+1. Must-check items
+   These are expected on every relevant review.
+2. Advisory items
+   These are worth checking when the code touches hot paths, concurrency,
+   serialization, or data access.
+
+Possible checklist topics
+-------------------------
+Must-check examples:
+- Does this change increase algorithmic complexity?
+- Does it add unnecessary allocation inside loops or per-request paths?
+- Does it add extra database or network round trips?
+- Does it materialize more data than the caller actually needs?
+- Does it introduce blocking work into an async path?
+- Does it create long-lived object retention or cache growth risk?
+- Does it add reflection or dynamic behavior in a hot path?
+- Does it change locking or synchronization behavior?
+- Does it duplicate parsing / serialization work?
+- Is there measurement for claimed performance improvements?
+
+Advisory examples:
+- Could pooling help here, or would it add needless complexity?
+- Would Span<T> or projection avoid copies in this path?
+- Is ValueTask justified by measurements?
+- Is this code shape JIT/runtime-friendly and predictable?
+- Does this change affect startup, trimming, or AOT compatibility?
+
+Team rollout plan
+-----------------
+1. Publish the first version as a short document.
+2. Ask reviewers to use it consistently for one month.
+3. Collect examples where it helped catch an issue.
+4. Remove low-value items and clarify vague items.
+5. Keep the checklist short enough that people actually use it.
+
+Evaluation after one month
+--------------------------
+Review:
+- which checklist items found real issues
+- which items were ignored or unclear
+- whether review time increased too much
+- whether authors started addressing performance concerns before review
+
+Deliverable
+-----------
+A team-friendly checklist that improves decision quality without turning every
+review into a full performance investigation.

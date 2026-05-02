@@ -1,0 +1,60 @@
+Exercise 05 — Organize a Team Performance Sharing Session
+=========================================================
+
+Goal
+----
+Turn performance knowledge into shared team capability instead of isolated
+individual expertise.
+
+Suggested topic selection
+-------------------------
+Choose one theme from the book that has strong practical value for your team,
+for example:
+- GC tuning fundamentals
+- async / await performance patterns
+- Span<T> and allocation reduction
+- database query shaping
+- BenchmarkDotNet usage and interpretation
+
+Suggested 30-minute structure
+-----------------------------
+1. Problem framing (5 minutes)
+   Explain why the topic matters in your codebase.
+
+2. Core principles (10 minutes)
+   Teach the underlying runtime or framework behavior in a clear way.
+
+3. Real example (10 minutes)
+   Show one concrete before/after case from a real or representative system.
+
+4. Practical guidance (5 minutes)
+   Give a short checklist of what teammates should do differently afterward.
+
+After the session
+-----------------
+Collect feedback such as:
+- what was clear
+- what remained confusing
+- what examples were most useful
+- what follow-up topics the team wants next
+
+How to evaluate the session
+---------------------------
+Possible indicators:
+- teammates can explain the topic back in their own words
+- code reviews start referencing the shared ideas
+- later changes show better performance awareness
+- follow-up questions become more specific and applied
+
+Deliverable
+-----------
+A lightweight knowledge-sharing artifact:
+- agenda or slide outline
+- one example case study
+- short takeaway checklist
+- summary of participant feedback
+
+What good looks like
+--------------------
+A successful session is not just one person giving a talk. It is a session that
+changes how the team makes performance decisions afterward.

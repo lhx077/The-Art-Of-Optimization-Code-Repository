@@ -1,0 +1,51 @@
+Exercise 04 — Study Performance in Containers
+==============================================
+
+Goal
+----
+Understand how the application behaves under realistic container resource
+constraints and identify the best configuration for CPU, memory, and GC.
+
+Suggested experiment matrix
+---------------------------
+Run the application in Docker with several resource profiles, for example:
+- 1 CPU / 2 GB memory
+- 2 CPU / 4 GB memory
+- 4 CPU / 8 GB memory
+
+For each configuration, observe:
+- throughput
+- average / p95 latency
+- memory usage
+- GC frequency and pause behavior
+- CPU saturation
+- startup time if relevant
+
+Additional GC-focused experiments
+---------------------------------
+Try changing environment settings such as:
+- DOTNET_GCHeapHardLimit
+- server GC vs workstation GC where relevant
+- any app-specific GC tuning that matches the deployment model
+
+Things to look for
+------------------
+1. Does the app scale linearly with more CPU?
+2. Does memory pressure trigger more GC than expected?
+3. Is there a point where more memory stops helping?
+4. Does the app become thread-starved under small CPU limits?
+5. Do configuration changes improve throughput but hurt latency, or vice versa?
+
+Recommended reporting format
+----------------------------
+For each container profile, record:
+- configuration
+- workload description
+- metrics collected
+- major observations
+- final recommendation
+
+Deliverable
+-----------
+A short report that identifies the best container configuration for the
+application and explains the tradeoffs behind that recommendation.

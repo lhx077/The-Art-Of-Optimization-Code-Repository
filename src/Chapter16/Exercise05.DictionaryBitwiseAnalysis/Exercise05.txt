@@ -1,0 +1,76 @@
+Exercise 05 — Dictionary Bitwise Analysis
+========================================
+
+Goal
+----
+Study how .NET's Dictionary<TKey, TValue> uses bit-oriented techniques to keep
+lookups, inserts, and resizes fast.
+
+Why this exercise is guidance-only
+----------------------------------
+The most valuable part of this exercise is reading the runtime source and
+connecting implementation details to the observable behavior of Dictionary.
+A fixed code sample would be much less useful than a structured reading guide.
+
+Recommended source targets
+--------------------------
+1. Dictionary<TKey, TValue> in the dotnet/runtime repository.
+2. HashHelpers and any related helpers used for capacity growth.
+3. Equality comparer and hashing paths that feed bucket selection.
+
+What to look for
+----------------
+1. Bucket index calculation.
+   Observe how the hash code is transformed into a bucket location. Compare the
+   modulo-based path with fast-mod style optimizations used on modern runtimes.
+
+2. Capacity growth policy.
+   Check how the implementation chooses new sizes during resize. Note whether it
+   prefers primes, power-of-two-friendly arithmetic, or helper-assisted fast
+   reduction.
+
+3. Free list and entry linking.
+   Track how integer fields encode next pointers, reuse slots, and distinguish
+   between active and free entries.
+
+4. Hash code normalization.
+   Inspect how sign bits, masking, or unsigned arithmetic keep hash values usable
+   for indexing.
+
+5. Collision-chain traversal.
+   Look for small arithmetic or bit-level choices that reduce extra branches or
+   unnecessary work in hot lookup loops.
+
+Suggested reading procedure
+---------------------------
+1. Start at TryInsert, FindValue, and Resize.
+2. For each method, mark every line that performs:
+   - masking
+   - shifting
+   - modulo or fast reduction
+   - sentinel encoding with integer values
+3. Write a short note beside each use explaining what higher-level cost it avoids.
+
+Points to extract in your report
+--------------------------------
+- Which operations are on the hot path of almost every lookup?
+- Which bitwise or low-level arithmetic choices reduce division cost?
+- How does the implementation balance memory layout with collision handling?
+- Which optimizations depend on runtime helpers rather than obvious source-level
+  bit tricks?
+
+Suggested report outline
+------------------------
+- Runtime version examined:
+- Files inspected:
+- Bitwise techniques identified:
+- Where each technique appears:
+- Why it helps performance:
+- Any tradeoffs in readability or flexibility:
+
+Expected outcome
+----------------
+By the end of the exercise, you should be able to explain that Dictionary
+performance is not only about big-O complexity. It also depends on low-level
+choices such as bucket reduction, compact entry linking, and arithmetic that
+keeps the hottest paths short and predictable.

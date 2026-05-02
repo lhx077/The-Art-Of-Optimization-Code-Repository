@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+option csharp_namespace = "Exercise04.GrpcVsRestComparison";
+
+package performance;
+
+service PayloadService {
+  rpc Process (PayloadRequest) returns (PayloadReply);
+}
+
+message PayloadRequest {
+  string payload = 1;
+  int32 repeat = 2;
+}
+
+message PayloadReply {
+  int32 checksum = 1;
+  int32 length = 2;
+}

@@ -1,0 +1,150 @@
+============================================================================
+Exercise 05 -- AOT-Compatible Dynamic Property Access Library
+============================================================================
+
+OBJECTIVE
+  Design a unified API for dynamic property access that works in both
+  JIT (using expression trees) and Native AOT (using source generators).
+
+BACKGROUND: THE AOT CHALLENGE
+  - Expression.Compile() uses System.Reflection.Emit internally
+  - Reflection.Emit is NOT available in Native AOT
+  - RuntimeFeature.IsDynamicCodeSupported returns false in AOT
+  - Source Generators run at compile time and produce regular C# code
+  - Ordinary reflection still works in AOT but is 50-200x slower
+
+ARCHITECTURE OVERVIEW
+
+  Define a common interface:
+    public interface IPropertyAccessor<T>
+    {
+        object? GetValue(T instance, string propertyName);
+        void SetValue(T instance, string propertyName, object? value);
+    }
+
+  Two implementations:
+    1. ExpressionTreeAccessor<T> -- for JIT environments
+    2. GeneratedAccessor<T> -- produced by Source Generator for AOT
+
+  Factory:
+    public static class PropertyAccess
+    {
+        public static IPropertyAccessor<T> Create<T>()
+        {
+            if (RuntimeFeature.IsDynamicCodeSupported)
+                return new ExpressionTreeAccessor<T>();
+            else
+                return GeneratedAccessorRegistry.Get<T>();
+        }
+    }
+
+STEP-BY-STEP IMPLEMENTATION
+
+  Step 1: Define the Common API
+    - IPropertyAccessor<T> interface as shown above.
+    - PropertyAccess factory class.
+    - Marker attribute for opting types into source generation:
+        [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct)]
+        public sealed class GenerateAccessorAttribute : Attribute { }
+    - Static registry populated by generated module initializers:
+        public static class GeneratedAccessorRegistry
+        {
+            private static readonly Dictionary<Type, object> _map = new();
+            public static void Register<T>(IPropertyAccessor<T> a)
+                => _map[typeof(T)] = a;
+            public static IPropertyAccessor<T> Get<T>()
+                => (IPropertyAccessor<T>)_map[typeof(T)];
+        }
+
+  Step 2: Implement ExpressionTreeAccessor<T>
+    - Build getter delegates with Expression.Lambda:
+        var param = Expression.Parameter(typeof(T), "instance");
+        var prop  = Expression.Property(param, propertyInfo);
+        var boxed = Expression.Convert(prop, typeof(object));
+        return Expression.Lambda<Func<T, object?>>(boxed, param).Compile();
+    - Build setter delegates similarly using Expression.Assign.
+    - Cache compiled delegates in ConcurrentDictionary (use GetOrAdd).
+    - Handle edge cases: read-only properties, value type boxing, nulls.
+
+  Step 3: Implement the Source Generator
+    - Create a project targeting netstandard2.0 with Roslyn references:
+        Microsoft.CodeAnalysis.Analyzers 3.3.4
+        Microsoft.CodeAnalysis.CSharp 4.8.0
+    - Implement IIncrementalGenerator:
+      a) Register a syntax provider filtering for [GenerateAccessor].
+      b) Collect each type's public instance properties (name, type,
+         has getter, has setter).
+      c) Generate one IPropertyAccessor<T> implementation per type.
+      d) Generate a [ModuleInitializer] method that registers all
+         generated accessors in GeneratedAccessorRegistry.
+
+  Step 4: Generated Code Example
+    For a class:
+      [GenerateAccessor]
+      public class Person { string Name; int Age; DateTime? BirthDate; }
+
+    The generator produces:
+      [GeneratedCode("PropertyAccessGenerator", "1.0")]
+      internal sealed class PersonAccessor : IPropertyAccessor<Person>
+      {
+          public object? GetValue(Person instance, string propertyName)
+              => propertyName switch
+              {
+                  "Name"      => instance.Name,
+                  "Age"       => instance.Age,
+                  "BirthDate" => instance.BirthDate,
+                  _ => throw new ArgumentException(...)
+              };
+
+          public void SetValue(Person instance, string propertyName, object? value)
+          {
+              switch (propertyName)
+              {
+                  case "Name":      instance.Name = (string)value!; break;
+                  case "Age":       instance.Age = (int)value!; break;
+                  case "BirthDate": instance.BirthDate = (DateTime?)value; break;
+                  default: throw new ArgumentException(...);
+              }
+          }
+      }
+
+    The switch compiles to a hash-jump table for O(1) dispatch.
+
+  Step 5: Testing Strategy
+    - Unit tests: verify both implementations produce identical results
+      using [Theory] + [MemberData] to parameterize over accessor types.
+    - Benchmark with BenchmarkDotNet (expected results):
+        | Method            | Mean     | Allocated |
+        |-------------------|----------|-----------|
+        | DirectAccess      |   ~1 ns  |     0 B   |
+        | GeneratedAccessor |   ~2 ns  |     0 B   |
+        | ExpressionTree    |   ~2 ns  |     0 B   |
+        | Reflection        | ~150 ns  |    40 B   |
+    - AOT validation:
+        dotnet publish -c Release -r win-x64 /p:PublishAot=true
+      Confirm the factory returns the generated accessor without errors.
+
+KEY DESIGN DECISIONS
+  - The factory pattern hides the implementation choice from consumers.
+  - Source generators produce zero-overhead code (identical to hand-written).
+  - Expression trees provide flexibility for types not known at compile time.
+  - The [GenerateAccessor] attribute is the opt-in mechanism for AOT support.
+  - Module initializers populate the registry before any user code runs.
+
+EXPECTED PERFORMANCE HIERARCHY
+  Direct access > Generated accessor ~ Expression tree >> Reflection
+  Generated and expression tree should be nearly identical in speed.
+  The generated accessor may have a slight edge because the JIT can
+  inline switch arms, while expression-tree delegates go through Func<>.
+
+FURTHER READING
+  - Source Generators cookbook:
+    https://github.com/dotnet/roslyn/blob/main/docs/features/incremental-generators.md
+  - Native AOT deployment:
+    https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot
+  - RuntimeFeature.IsDynamicCodeSupported:
+    https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.runtimefeature.isdynamiccodesupported
+  - Expression Trees:
+    https://learn.microsoft.com/en-us/dotnet/csharp/advanced-topics/expression-trees
+
+============================================================================

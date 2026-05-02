@@ -1,0 +1,236 @@
+================================================================================
+Chapter 23 — Entity Framework Core Performance Optimization
+                    Thought Question Answers
+================================================================================
+
+
+Question 1: In a deep entity graph such as Order -> Customer -> Address and
+Order -> OrderDetails -> Product -> Category, how should an efficient loading
+strategy be designed? What are the tradeoffs between eager loading everything
+and loading on demand?
+--------------------------------------------------------------------------------
+
+The correct strategy is usually selective loading, not “always eager” and not
+“always on demand.”
+
+1. Start from the use case, not from the full object graph.
+   If the screen only needs an order summary, project directly to a DTO with the
+   exact fields required. That avoids materializing a large graph at all.
+
+2. Use eager loading only for relationships that are both:
+   - definitely needed in the current request
+   - reasonably bounded in size
+
+3. Prefer split queries when including multiple collection navigations.
+   A single huge join can create row multiplication, duplicate payload transfer,
+   and large temporary memory pressure. Split queries often trade a few extra
+   round trips for much lower result inflation.
+
+4. Use explicit loading for rare branches.
+   For example, load Order and Customer eagerly, but load OrderDetails only when
+   the user expands the detail panel.
+
+5. Avoid lazy loading on hot paths.
+   Lazy loading can hide N+1 problems and makes performance harder to reason
+   about because navigation access implicitly triggers database work.
+
+Eager loading everything:
+- Pros:
+  - simple caller model
+  - avoids some N+1 issues
+  - one request can have a fully populated graph
+- Cons:
+  - over-fetching
+  - larger joins and duplicated rows
+  - higher memory usage
+  - slower materialization when only a subset is needed
+
+Loading on demand:
+- Pros:
+  - smaller initial query
+  - better fit when only a few branches are actually used
+  - less over-fetching
+- Cons:
+  - risk of N+1 queries
+  - more round trips
+  - harder to predict latency if loading rules are not explicit
+
+So the practical rule is: project by default, eagerly load bounded required
+relationships, use split queries for large include graphs, and reserve explicit
+loading for optional branches.
+
+
+Question 2: Change tracking can become a bottleneck for large result sets.
+Beyond no-tracking queries, what architectural designs reduce the need for
+tracking? How does CQRS help?
+--------------------------------------------------------------------------------
+
+The biggest optimization is often to stop treating every read as if it might
+become a write.
+
+Architectural techniques include:
+
+1. CQRS.
+   Separate the read model from the write model.
+   - Query side: use projections, no-tracking queries, read replicas, and even
+     alternate tools such as Dapper.
+   - Command side: load only the aggregate that is actually being changed.
+
+   This dramatically reduces the number of scenarios where EF Core must build a
+   tracked object graph.
+
+2. Read-specific DTO pipelines.
+   Instead of returning entities to upper layers, return immutable read models.
+   Once callers stop depending on tracked entities, accidental tracking demand
+   disappears.
+
+3. Aggregate-focused write boundaries.
+   Load and track only the aggregate root plus the small set of children needed
+   for the command. Do not reuse a “query everything” model for updates.
+
+4. Dedicated reporting paths.
+   Heavy dashboards and reports should not run through a tracked DbContext that
+   was designed for transactional updates.
+
+5. Short-lived DbContext usage.
+   Treat DbContext as a unit-of-work boundary. This prevents long-lived tracked
+   graphs from accumulating in memory.
+
+CQRS helps because it makes the distinction explicit:
+- reads optimize for shape, throughput, and low allocation
+- writes optimize for consistency and invariant enforcement
+
+That separation removes a large class of unnecessary tracking overhead.
+
+
+Question 3: ExecuteUpdate and ExecuteDelete bypass change tracking. How can you
+use them safely while preserving audit logging, cascading behavior, and business
+rule validation?
+--------------------------------------------------------------------------------
+
+These APIs are safest when they are used inside a disciplined bulk-operation
+workflow rather than as ad hoc shortcuts.
+
+A good approach is:
+
+1. Validate first at the domain boundary.
+   Build the target set using business-safe predicates before issuing the bulk
+   command. Never let callers pass arbitrary filters directly into bulk writes.
+
+2. Record audit intent explicitly.
+   Because tracked entity events are skipped, write audit rows separately before
+   or after the bulk statement. The audit record should capture:
+   - operator / job identity
+   - target predicate or batch id
+   - old/new state summary where feasible
+   - timestamp and correlation id
+
+3. Use database constraints and triggers where appropriate.
+   If a rule must hold regardless of application path, enforce it in the
+   database as well. Bulk APIs should not be the only place where correctness is
+   assumed.
+
+4. Prefer staged workflows for complex bulk changes.
+   For example:
+   - identify rows into a staging table or batch id
+   - validate the batch
+   - write audit metadata
+   - execute bulk update/delete
+   - publish domain events based on the batch id
+
+5. Be explicit about cascading semantics.
+   Application-side tracked cascades do not run. If the operation depends on
+   cascade delete or child updates, confirm whether the database foreign keys and
+   triggers implement the required behavior.
+
+6. Rebuild derived state when needed.
+   If caches, search indexes, or projections depend on the changed rows, publish
+   a bulk domain event after completion.
+
+So the pattern is: validate the target set, audit the batch explicitly, rely on
+real database constraints for invariant enforcement, and publish follow-up work
+for dependent systems.
+
+
+Question 4: In microservices, cross-service bulk operations make transaction
+boundaries difficult. How can consistency be preserved? How do Saga and
+compensation apply?
+--------------------------------------------------------------------------------
+
+Cross-service bulk work should generally avoid distributed ACID transactions.
+Instead, consistency is maintained through orchestration, idempotency, and
+compensation.
+
+A practical design is:
+
+1. Break the workflow into local transactions.
+   Each service commits only to its own database.
+
+2. Use a Saga.
+   The Saga defines:
+   - the ordered steps
+   - the success events for each step
+   - the compensating action for each step if a later step fails
+
+3. Make every step idempotent.
+   Retries are normal in distributed systems, especially for batch jobs.
+
+4. Use durable messaging / outbox.
+   The service should persist its state change and its integration event in the
+   same local transaction, then publish reliably.
+
+5. Prefer state transitions over destructive mutation during long workflows.
+   For example, mark rows as PendingArchive, Archived, or RollbackRequired
+   instead of deleting immediately. This gives the Saga clearer control points.
+
+Saga example:
+- Service A marks 10000 rows as ReadyToShip.
+- Service B reserves capacity.
+- Service C creates billing records.
+- If Service C fails, Service B releases capacity and Service A moves the batch
+  back to a compensating state.
+
+Compensation is not “undo everything perfectly” in a low-level sense. It is a
+business-level correction that restores a valid system state.
+
+
+Question 5: If the application must support SQL Server, PostgreSQL, and MySQL,
+but some queries need provider-specific features for best performance, how can
+the data access layer balance portability and optimization?
+--------------------------------------------------------------------------------
+
+The right balance is layered design.
+
+1. Keep the common path provider-neutral.
+   Most CRUD and straightforward queries should stay in standard EF Core LINQ and
+   shared domain mappings.
+
+2. Isolate provider-specific optimizations behind narrow interfaces.
+   For example:
+   - IOrderSearchQueries
+   - IReportSqlDialect
+   - IProviderBulkLoader
+
+   The application depends on the abstraction; provider-specific projects hold
+   the optimized implementations.
+
+3. Use capability-based branching, not scattered if-statements.
+   Centralize provider detection and feature flags in one place.
+
+4. Prefer projection boundaries.
+   Provider-specific SQL is often best for reporting, search, or bulk paths.
+   Keep those as dedicated query services rather than mixing them into generic
+   repositories.
+
+5. Test both semantic correctness and performance.
+   A shared contract test suite should verify that SQL Server, PostgreSQL, and
+   MySQL implementations all return equivalent business results, even if the SQL
+   differs.
+
+6. Accept that the hottest 5 percent of queries may deserve custom treatment.
+   Total portability is attractive, but forcing every path through the lowest
+   common denominator can leave large performance gains on the table.
+
+So the practical model is: keep the majority portable, isolate the exceptional
+high-performance paths, and make provider-specific behavior explicit rather than
+accidental.
