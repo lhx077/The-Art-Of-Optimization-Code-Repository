@@ -119,7 +119,7 @@ Question 1: [Question text]
 
 ## Tech Stack
 
-- **.NET 10** (Preview)
+- **.NET 10** 
 - **BenchmarkDotNet** — Benchmarking framework
 - **Microsoft.CodeAnalysis** — Roslyn API / Source Generators
 - **System.IO.Pipelines** — High-performance I/O
