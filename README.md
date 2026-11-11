@@ -1,6 +1,6 @@
-# The Art of Optimization: A Deep Dive into the Peak of .NET Performance — Practice
+# The Art of Optimization: A Deep Dive into the Peak of .NET Performance — Code Repository
 
-Companion exercise repository for *The Art of Optimization: A Deep Dive into the Peak of .NET Performance*, covering Chapters 2–25 with 131 hands-on exercises and 24 chapters of thought question answers.
+COde repository for *The Art of Optimization: A Deep Dive into the Peak of .NET Performance*, covering Chapters 2–25 with 131 hands-on exercises and 24 chapters of thought question answers.
 
 ## Prerequisites
 
